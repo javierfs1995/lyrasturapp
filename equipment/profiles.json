@@ -1,0 +1,28 @@
+{
+  "profiles": [
+    {
+      "name": "Newton 76/700 + ASI678MC",
+      "telescope": {
+        "name": "Newton 76/700",
+        "focal_mm": 700.0
+      },
+      "camera": {
+        "name": "ZWO ASI678MC",
+        "pixel_um": 2.0
+      },
+      "focal_multiplier": 1.0
+    },
+    {
+      "name": "Refractor 80/480 + ASI533MC",
+      "telescope": {
+        "name": "Refractor 80/480",
+        "focal_mm": 480.0
+      },
+      "camera": {
+        "name": "ZWO ASI533MC",
+        "pixel_um": 3.76
+      },
+      "focal_multiplier": 1.0
+    }
+  ]
+}

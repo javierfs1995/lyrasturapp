@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AstroApp - Selector de ubicación</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Qt WebChannel -->
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+
+  <style>
+    html, body { margin: 0; height: 100%; background: #1b2227; }
+    #map { width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <script>
+    // Mapa por defecto (Oviedo aprox)
+    const map = L.map('map').setView([43.3619, -5.8494], 11);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18
+    }).addTo(map);
+
+    let marker = null;
+    function setMarker(lat, lon) {
+      if (marker) map.removeLayer(marker);
+      marker = L.marker([lat, lon]).addTo(map);
+    }
+
+    // Función llamada desde Python para centrar y poner marcador inicial
+    window.setInitialPosition = function(lat, lon, zoom) {
+      map.setView([lat, lon], zoom || 12);
+      setMarker(lat, lon);
+    };
+
+    // Puente WebChannel
+    let bridge = null;
+    new QWebChannel(qt.webChannelTransport, function(channel) {
+      bridge = channel.objects.bridge;
+      if (bridge && bridge.requestInitial) {
+        bridge.requestInitial();
+      }
+    });
+
+    // Click → enviar a Python
+    map.on('click', function(e) {
+      const lat = e.latlng.lat;
+      const lon = e.latlng.lng;
+      setMarker(lat, lon);
+
+      if (bridge && bridge.setCoords) {
+        bridge.setCoords(lat, lon);
+      }
+    });
+  </script>
+</body>
+</html>
