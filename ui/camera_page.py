@@ -113,7 +113,6 @@ def _qimage_from_ndarray(frame: np.ndarray) -> QImage:
     return QImage()
 
 
-
 def _clamp(v: int, a: int, b: int) -> int:
     return max(a, min(b, v))
 
