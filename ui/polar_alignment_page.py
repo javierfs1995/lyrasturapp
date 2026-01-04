@@ -40,6 +40,12 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 
+# ─────────────────────────────────────────────
+# Polaris confirmation constants
+# ─────────────────────────────────────────────
+POLARIS_CONFIRM_FRAMES = 8          # ADDED: frames needed to confirm
+POLARIS_CONFIRM_RADIUS_PX = 6.0     # ADDED: max movement between frames (px)
+
 
 # ─────────────────────────────────────────────
 # FrameBus safe import / singleton accessor
@@ -216,6 +222,13 @@ class AlignmentState:
     last_t: float = 0.0
     # pixels -> arcmin (rough). You can calibrate later with plate solve.
     arcsec_per_px: float = 2.0  # default; editable in UI
+
+    # ────────────────
+    # Polaris confirmation (ADDED)
+    # ────────────────
+    polaris_confirmed: bool = False
+    confirm_count: int = 0
+    last_confirm_pos: Optional[Tuple[float, float]] = None
 
 
 # ─────────────────────────────────────────────
@@ -503,6 +516,12 @@ class PolarAlignmentPage(QWidget):
     def _reset(self):
         self.state.polaris = None
         self.state.polaris_s = None
+
+        # ADDED: reset confirmation state
+        self.state.polaris_confirmed = False
+        self.state.confirm_count = 0
+        self.state.last_confirm_pos = None
+
         self._set_status("Reiniciado. Esperando Live View…")
         self._update_errors(0.0, 0.0)
         self._update_overlay()
@@ -579,6 +598,11 @@ class PolarAlignmentPage(QWidget):
         - Finds brightest star
         - Stabilizes using previous position (seed search)
         - Computes error vector relative to center
+
+        ADDED:
+        - Polaris temporal confirmation (must be stable N frames)
+        - Until confirmed: no arrows, orange point, status "Confirmando Polaris..."
+        - After confirmed: arrows enabled, green point
         """
         now = time.time()
         if not force and (now - self.state.last_t) < 0.10:
@@ -593,6 +617,12 @@ class PolarAlignmentPage(QWidget):
             self._set_status("No se detecta Polaris (insuficientes estrellas / señal).")
             self.state.polaris = None
             self.state.polaris_s = None
+
+            # ADDED: reset confirmation on lost polaris
+            self.state.polaris_confirmed = False
+            self.state.confirm_count = 0
+            self.state.last_confirm_pos = None
+
             self._update_errors(0.0, 0.0)
             self._update_overlay()
             return
@@ -609,6 +639,33 @@ class PolarAlignmentPage(QWidget):
                 self.state.polaris_s[1] * (1 - a) + p[1] * a,
             )
 
+        # ────────────────────────────────
+        # ADDED: Temporal confirmation of Polaris
+        # ────────────────────────────────
+        if self.state.polaris_s is not None:
+            if self.state.last_confirm_pos is None:
+                self.state.last_confirm_pos = self.state.polaris_s
+                self.state.confirm_count = 1
+                self.state.polaris_confirmed = False
+            else:
+                dpx = _dist(self.state.polaris_s, self.state.last_confirm_pos)
+
+                if dpx <= POLARIS_CONFIRM_RADIUS_PX:
+                    self.state.confirm_count += 1
+                else:
+                    self.state.confirm_count = 0
+                    self.state.polaris_confirmed = False
+
+                # update last for next comparison
+                self.state.last_confirm_pos = self.state.polaris_s
+
+            if self.state.confirm_count >= POLARIS_CONFIRM_FRAMES:
+                self.state.polaris_confirmed = True
+        else:
+            self.state.polaris_confirmed = False
+            self.state.confirm_count = 0
+            self.state.last_confirm_pos = None
+
         # Error vector: target center - polaris
         cx, cy = self.state.center
         px, py = self.state.polaris_s
@@ -619,18 +676,36 @@ class PolarAlignmentPage(QWidget):
         arcmin_x = (dx * self.state.arcsec_per_px) / 60.0
         arcmin_y = (dy * self.state.arcsec_per_px) / 60.0
 
-        self._update_errors(arcmin_x, arcmin_y)
+        # Update overlay always (dot position)
         self._update_overlay()
 
         # info panel
         dist_px = _dist((cx, cy), (px, py))
         dist_arcmin = (dist_px * self.state.arcsec_per_px) / 60.0
+
+        # ADDED: Live confirmation text
+        conf_txt = "CONFIRMADA ✅" if self.state.polaris_confirmed else f"confirmando… ({self.state.confirm_count}/{POLARIS_CONFIRM_FRAMES})"
+
         self.lbl_info.setText(
             f"Live View: OK\n"
-            f"Polaris: x={px:.1f}, y={py:.1f}\n"
+            f"Polaris: x={px:.1f}, y={py:.1f} ({conf_txt})\n"
             f"Distancia al objetivo: {dist_arcmin:.2f}′\n"
             f"Escala: {self.state.arcsec_per_px:.2f} arcsec/px\n"
         )
+
+        # ────────────────────────────────
+        # MODIFIED: Only compute/show arrows AFTER confirmation
+        # ────────────────────────────────
+        if not self.state.polaris_confirmed:
+            # while confirming, freeze errors and hide arrows
+            self._set_status("Confirmando Polaris… mantén la montura estable")
+            self._update_errors(0.0, 0.0)
+            self.az_arrow.setVisible(False)
+            self.alt_arrow.setVisible(False)
+            return
+
+        # Normal behavior after confirmation
+        self._update_errors(arcmin_x, arcmin_y)
 
         if dist_arcmin < 0.5:
             self._set_status("Alineación correcta ✅")
@@ -664,29 +739,37 @@ class PolarAlignmentPage(QWidget):
             px, py = self.state.polaris_s
             dot_r = 6.0
             self.polaris_dot.setRect(QRectF(px - dot_r, py - dot_r, 2 * dot_r, 2 * dot_r))
+
+            # ADDED: change dot color depending on confirmation
+            if getattr(self.state, "polaris_confirmed", False):
+                col = QColor("#3cff4e")  # green confirmed
+            else:
+                col = QColor("#ff9a3d")  # orange confirming
+
+            self.polaris_dot.setPen(QPen(col, 2))
+            self.polaris_dot.setBrush(QBrush(col))
+
             self.polaris_dot.setVisible(True)
         else:
             self.polaris_dot.setVisible(False)
 
         # Arrows (derived from current labels if possible)
-        # We'll parse current az/alt numbers stored in label text? Better store last.
         ax = getattr(self, "_last_arcmin_x", 0.0)
         ay = getattr(self, "_last_arcmin_y", 0.0)
 
         # Map arcmin -> pixels for arrows (visual only)
-        # Keep arrows within a sensible length
         scale_px = 25.0  # px per arcmin, for UI
         vx = _clamp(ax * scale_px, -120, 120)
         vy = _clamp(ay * scale_px, -120, 120)
 
-        # Azimuth arrow is horizontal (cyan), Altitude vertical (yellow)
-        # Direction convention:
-        #  - If ax > 0, move left/west  (show arrow left)
-        #  - If ax < 0, move right/east (show arrow right)
-        #  - If ay > 0, move up        (show arrow up)
-        #  - If ay < 0, move down      (show arrow down)
         self.az_arrow.setLine(cx, cy + r + 18, cx - vx, cy + r + 18)
         self.alt_arrow.setLine(cx + r + 18, cy, cx + r + 18, cy - vy)
+
+        # MODIFIED: hide arrows if NOT confirmed
+        if not getattr(self.state, "polaris_confirmed", False):
+            self.az_arrow.setVisible(False)
+            self.alt_arrow.setVisible(False)
+            return
 
         # Hide arrows if almost aligned
         total = math.hypot(ax, ay)
@@ -699,8 +782,6 @@ class PolarAlignmentPage(QWidget):
     # ─────────────────────────
     @staticmethod
     def _fmt_arcmin(v: float) -> str:
-        # Show like 00° 05′ 22″ style? We'll approximate:
-        # Convert arcmin -> degrees/min/sec:
         sign = "-" if v < 0 else ""
         v = abs(v)
         deg = int(v // 60.0)
@@ -713,11 +794,8 @@ class PolarAlignmentPage(QWidget):
         self._last_arcmin_x = float(arcmin_x)
         self._last_arcmin_y = float(arcmin_y)
 
-        # Total
         total = math.hypot(arcmin_x, arcmin_y)
 
-        # Text like NINA
-        # Azimuth: left/west vs right/east
         az_dir = "Move left/west ←" if arcmin_x > 0 else ("Move right/east →" if arcmin_x < 0 else "—")
         alt_dir = "Move up ↑" if arcmin_y > 0 else ("Move down ↓" if arcmin_y < 0 else "—")
 
@@ -737,10 +815,7 @@ class PolarAlignmentPage(QWidget):
     # Timers
     # ─────────────────────────
     def _tick_ui(self):
-        # Keep overlay aligned to view; this is cheap and prevents "drift"
         self._update_overlay()
-
-        # If no frames and no demo, keep the waiting message
         if self._last_frame is None and not self.demo_timer.isActive():
             self.lbl_info.setText("Live View: —\nPolaris: —\n")
 
@@ -748,24 +823,20 @@ class PolarAlignmentPage(QWidget):
     # Demo frames (Polaris-like)
     # ─────────────────────────
     def _demo_step(self):
-        # Create a star field with a bright Polaris that slightly jitters
         w, h = 1280, 720
         img = np.random.normal(10, 6, (h, w)).astype(np.float32)
         img = np.clip(img, 0, 255)
 
-        # fixed "true" polaris near center but not exact
         cx, cy = w / 2, h / 2
         t = time.time()
         px = cx - 80 + math.sin(t * 0.8) * 2.0
         py = cy + 25 + math.cos(t * 0.7) * 2.0
 
-        # draw some stars
         for _ in range(180):
             sx = np.random.randint(0, w)
             sy = np.random.randint(0, h)
             img[sy, sx] = 255
 
-        # draw polaris as a small gaussian blob
         rr = 7
         x0 = int(_clamp(px - rr, 0, w - 1))
         x1 = int(_clamp(px + rr, 0, w - 1))
@@ -782,7 +853,6 @@ class PolarAlignmentPage(QWidget):
         self._render_frame(img)
 
         if getattr(self, "_semi_live", True):
-            # In demo, default to semi-live for UX
             self._semi_live = True
             self.btn_semi_live.setText("⏸ Pausar semi-en vivo")
             self._solve_frame(img, force=False)
