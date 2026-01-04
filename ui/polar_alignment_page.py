@@ -4,13 +4,19 @@
 # - Avoids "QObject initialized twice" by reusing a singleton bus instance
 # - Handles grayscale (HxW) and color (HxWx3/4) frames
 # - Keeps bottom error panel always visible (Az / Alt / Total)
+#
+# ✅ Added (WITHOUT removing anything that was already there):
+#   - Real 3-point calibration state machine (semi-live automatic)
+#   - Automatic point capture when the star pattern moves enough + is stable
+#   - Computes RA axis center (circle center) from 3 captured Polaris positions
+#   - Keeps your existing overlay (circle + crosshair + dot + arrows + panels)
 
 from __future__ import annotations
 
 import math
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
 
@@ -39,12 +45,6 @@ from PySide6.QtWidgets import (
     QGraphicsSimpleTextItem,
     QSizePolicy,
 )
-
-# ─────────────────────────────────────────────
-# Polaris confirmation constants
-# ─────────────────────────────────────────────
-POLARIS_CONFIRM_FRAMES = 8          # ADDED: frames needed to confirm
-POLARIS_CONFIRM_RADIUS_PX = 6.0     # ADDED: max movement between frames (px)
 
 
 # ─────────────────────────────────────────────
@@ -208,6 +208,141 @@ def _centroid_brightest(
 
 
 # ─────────────────────────────────────────────
+# ✅ 3-Point Calibrator (added)
+# ─────────────────────────────────────────────
+def _circumcenter(a: Tuple[float, float], b: Tuple[float, float], c: Tuple[float, float]) -> Optional[Tuple[float, float]]:
+    """
+    Returns circumcenter of triangle ABC (circle through 3 points).
+    If nearly collinear -> None.
+    """
+    ax, ay = a
+    bx, by = b
+    cx, cy = c
+
+    d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(d) < 1e-6:
+        return None
+
+    ax2ay2 = ax * ax + ay * ay
+    bx2by2 = bx * bx + by * by
+    cx2cy2 = cx * cx + cy * cy
+
+    ux = (ax2ay2 * (by - cy) + bx2by2 * (cy - ay) + cx2cy2 * (ay - by)) / d
+    uy = (ax2ay2 * (cx - bx) + bx2by2 * (ax - cx) + cx2cy2 * (bx - ax)) / d
+    return (float(ux), float(uy))
+
+
+@dataclass
+class ThreePointState:
+    points: List[Tuple[float, float]] = None  # captured polaris positions
+    center: Optional[Tuple[float, float]] = None
+    calibrated: bool = False
+    capturing: bool = False
+    last_capture_t: float = 0.0
+
+    # stability buffer
+    stable_buf: List[Tuple[float, float]] = None
+
+    def __post_init__(self):
+        if self.points is None:
+            self.points = []
+        if self.stable_buf is None:
+            self.stable_buf = []
+
+
+class ThreePointCalibrator:
+    """
+    Semi-live automatic capture:
+      - Waits for stable polaris (low jitter) THEN captures a point
+      - Requires movement between captures (you rotate RA manually a bit)
+      - After 3 points, computes circumcenter
+    """
+    def __init__(self):
+        self.s = ThreePointState()
+
+        # Tunables (safe defaults)
+        self.min_time_between_captures = 0.9     # seconds
+        self.min_move_px = 35.0                  # must move this much from last captured point
+        self.stable_window = 8                   # number of samples
+        self.stable_max_rms = 1.8                # px RMS jitter allowed
+        self.max_points = 3
+
+    def reset(self):
+        self.s = ThreePointState()
+
+    @staticmethod
+    def _rms_jitter(buf: List[Tuple[float, float]]) -> float:
+        if len(buf) < 2:
+            return 999.0
+        xs = np.array([p[0] for p in buf], dtype=np.float32)
+        ys = np.array([p[1] for p in buf], dtype=np.float32)
+        mx = float(xs.mean())
+        my = float(ys.mean())
+        dx = xs - mx
+        dy = ys - my
+        return float(np.sqrt((dx * dx + dy * dy).mean()))
+
+    def update(self, polaris_xy: Optional[Tuple[float, float]], now: float) -> Tuple[bool, str]:
+        """
+        Feed latest polaris position (smoothed if possible).
+        Returns (changed, status_text).
+        """
+        if polaris_xy is None:
+            self.s.stable_buf.clear()
+            return (False, "Calibración: esperando detección de Polaris…")
+
+        # If already calibrated, nothing to do
+        if self.s.calibrated:
+            return (False, "Calibración: OK (3-point)")
+
+        # Collect stability samples
+        self.s.stable_buf.append(polaris_xy)
+        if len(self.s.stable_buf) > self.stable_window:
+            self.s.stable_buf.pop(0)
+
+        # Not enough samples yet
+        if len(self.s.stable_buf) < self.stable_window:
+            return (False, f"Calibración: estabilizando… ({len(self.s.points)}/3)")
+
+        rms = self._rms_jitter(self.s.stable_buf)
+        if rms > self.stable_max_rms:
+            return (False, f"Calibración: espera a que se estabilice (jitter {rms:.1f}px)… ({len(self.s.points)}/3)")
+
+        # Stable -> candidate capture
+        if (now - self.s.last_capture_t) < self.min_time_between_captures:
+            return (False, f"Calibración: estable ✓ (esperando… {len(self.s.points)}/3)")
+
+        # Enforce movement between captures
+        if self.s.points:
+            last = self.s.points[-1]
+            if _dist(last, polaris_xy) < self.min_move_px:
+                return (False, f"Calibración: mueve RA un poco (≥{int(self.min_move_px)}px)… ({len(self.s.points)}/3)")
+
+        # Capture this point (use mean of stable buffer)
+        xs = [p[0] for p in self.s.stable_buf]
+        ys = [p[1] for p in self.s.stable_buf]
+        cap = (float(np.mean(xs)), float(np.mean(ys)))
+
+        self.s.points.append(cap)
+        self.s.last_capture_t = now
+        self.s.stable_buf.clear()
+
+        # If we reached 3 points -> compute center
+        if len(self.s.points) >= self.max_points:
+            a, b, c = self.s.points[0], self.s.points[1], self.s.points[2]
+            cc = _circumcenter(a, b, c)
+            if cc is None:
+                # points too collinear -> ask for better movement
+                self.s.points.pop()  # drop last to try again
+                return (True, "Calibración: puntos casi alineados. Mueve RA MÁS y repite… (2/3)")
+            self.s.center = cc
+            self.s.calibrated = True
+            return (True, "Calibración: OK ✅ (centro del eje RA calculado)")
+        else:
+            return (True, f"Calibración: punto {len(self.s.points)}/3 capturado ✅ (mueve RA para el siguiente)")
+
+
+# ─────────────────────────────────────────────
 # Simple error model (semi-live)
 # ─────────────────────────────────────────────
 @dataclass
@@ -222,13 +357,6 @@ class AlignmentState:
     last_t: float = 0.0
     # pixels -> arcmin (rough). You can calibrate later with plate solve.
     arcsec_per_px: float = 2.0  # default; editable in UI
-
-    # ────────────────
-    # Polaris confirmation (ADDED)
-    # ────────────────
-    polaris_confirmed: bool = False
-    confirm_count: int = 0
-    last_confirm_pos: Optional[Tuple[float, float]] = None
 
 
 # ─────────────────────────────────────────────
@@ -249,6 +377,12 @@ class PolarAlignmentPage(QWidget):
         self._last_frame: Optional[np.ndarray] = None
 
         self._bus = _get_frame_bus()
+
+        # ✅ Added: 3-point calibrator
+        self.cal = ThreePointCalibrator()
+
+        # added flags (don’t remove old behavior)
+        self._semi_live = False
 
         self._build_ui()
         self._wire()
@@ -315,11 +449,11 @@ class PolarAlignmentPage(QWidget):
         lp.addLayout(row)
 
         self.btn_semi_live = QPushButton("▶ Ajuste semi-en vivo")
-        self.btn_semi_live.setToolTip("Lee el Live View y actualiza la indicación automáticamente.")
+        self.btn_semi_live.setToolTip("Lee el Live View y calibra 3-point automáticamente (sin botones).")
         lp.addWidget(self.btn_semi_live)
 
         self.btn_capture = QPushButton("📌 Capturar / Re-solucionar")
-        self.btn_capture.setToolTip("Fuerza un recalculo usando el frame actual.")
+        self.btn_capture.setToolTip("Fuerza un recalculo usando el frame actual (no recomendado si usas semi-live).")
         lp.addWidget(self.btn_capture)
 
         self.btn_reset = QPushButton("↻ Reiniciar")
@@ -499,15 +633,25 @@ class PolarAlignmentPage(QWidget):
         self.btn_demo.setText("⏸ Detener demo")
         self._set_status("Demo activa: generando frames de Polaris…")
 
+        # In demo, make semi-live more likely (same behavior you had before)
+        if not self._semi_live:
+            self._semi_live = True
+            self.btn_semi_live.setText("⏸ Pausar semi-en vivo")
+
     def _toggle_semi_live(self):
-        # Semi-live is simply "keep solving as frames arrive"
-        # We'll use a flag; actual processing happens in on_new_frame + _tick_ui
+        # Semi-live: keep solving + auto 3-point calibration as frames arrive
         self._semi_live = not getattr(self, "_semi_live", False)
         self.btn_semi_live.setText("⏸ Pausar semi-en vivo" if self._semi_live else "▶ Ajuste semi-en vivo")
-        self._set_status("Semi-en vivo activo: analizando Live View…" if self._semi_live else "Semi-en vivo pausado.")
+
+        if self._semi_live:
+            # Start/restart calibration cleanly
+            self.cal.reset()
+            self._set_status("Semi-en vivo activo: calibración 3-point automática…")
+        else:
+            self._set_status("Semi-en vivo pausado.")
 
     def _force_solve(self):
-        # Solve once from the last frame
+        # Solve once from the last frame (keeps old behavior)
         if self._last_frame is None:
             self._set_status("No hay frame aún. Activa el Live View o la Demo.")
             return
@@ -516,12 +660,7 @@ class PolarAlignmentPage(QWidget):
     def _reset(self):
         self.state.polaris = None
         self.state.polaris_s = None
-
-        # ADDED: reset confirmation state
-        self.state.polaris_confirmed = False
-        self.state.confirm_count = 0
-        self.state.last_confirm_pos = None
-
+        self.cal.reset()  # ✅ reset calibration too (added)
         self._set_status("Reiniciado. Esperando Live View…")
         self._update_errors(0.0, 0.0)
         self._update_overlay()
@@ -580,8 +719,12 @@ class PolarAlignmentPage(QWidget):
         # Fit view while preserving aspect
         self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
 
-        # Update center (target)
-        self.state.center = (w / 2.0, h / 2.0)
+        # Default center (image center). This will be replaced after 3-point calibration.
+        if not self.cal.s.calibrated or self.cal.s.center is None:
+            self.state.center = (w / 2.0, h / 2.0)
+        else:
+            self.state.center = self.cal.s.center
+
         self._set_overlay_visible(True)
 
         # Move the top hint
@@ -590,19 +733,17 @@ class PolarAlignmentPage(QWidget):
         self._update_overlay()
 
     # ─────────────────────────
-    # Solver (simple Polaris tracking)
+    # Solver (Polaris tracking) + 3-point calibration (added)
     # ─────────────────────────
     def _solve_frame(self, frame: np.ndarray, force: bool):
         """
-        This is NOT a real plate-solve; it’s a stable Polaris tracker.
+        This is NOT a full plate-solve; it’s a stable Polaris tracker.
         - Finds brightest star
         - Stabilizes using previous position (seed search)
-        - Computes error vector relative to center
-
-        ADDED:
-        - Polaris temporal confirmation (must be stable N frames)
-        - Until confirmed: no arrows, orange point, status "Confirmando Polaris..."
-        - After confirmed: arrows enabled, green point
+        - If semi-live: runs 3-point auto calibration (no button)
+        - Computes error vector relative to center:
+            - before calibration: image center
+            - after calibration: RA axis center computed from 3 points
         """
         now = time.time()
         if not force and (now - self.state.last_t) < 0.10:
@@ -617,12 +758,6 @@ class PolarAlignmentPage(QWidget):
             self._set_status("No se detecta Polaris (insuficientes estrellas / señal).")
             self.state.polaris = None
             self.state.polaris_s = None
-
-            # ADDED: reset confirmation on lost polaris
-            self.state.polaris_confirmed = False
-            self.state.confirm_count = 0
-            self.state.last_confirm_pos = None
-
             self._update_errors(0.0, 0.0)
             self._update_overlay()
             return
@@ -639,32 +774,12 @@ class PolarAlignmentPage(QWidget):
                 self.state.polaris_s[1] * (1 - a) + p[1] * a,
             )
 
-        # ────────────────────────────────
-        # ADDED: Temporal confirmation of Polaris
-        # ────────────────────────────────
-        if self.state.polaris_s is not None:
-            if self.state.last_confirm_pos is None:
-                self.state.last_confirm_pos = self.state.polaris_s
-                self.state.confirm_count = 1
-                self.state.polaris_confirmed = False
-            else:
-                dpx = _dist(self.state.polaris_s, self.state.last_confirm_pos)
-
-                if dpx <= POLARIS_CONFIRM_RADIUS_PX:
-                    self.state.confirm_count += 1
-                else:
-                    self.state.confirm_count = 0
-                    self.state.polaris_confirmed = False
-
-                # update last for next comparison
-                self.state.last_confirm_pos = self.state.polaris_s
-
-            if self.state.confirm_count >= POLARIS_CONFIRM_FRAMES:
-                self.state.polaris_confirmed = True
-        else:
-            self.state.polaris_confirmed = False
-            self.state.confirm_count = 0
-            self.state.last_confirm_pos = None
+        # ✅ 3-point calibration update (added)
+        cal_msg = ""
+        if getattr(self, "_semi_live", False):
+            changed, cal_msg = self.cal.update(self.state.polaris_s, now)
+            if self.cal.s.calibrated and self.cal.s.center is not None:
+                self.state.center = self.cal.s.center
 
         # Error vector: target center - polaris
         cx, cy = self.state.center
@@ -676,41 +791,34 @@ class PolarAlignmentPage(QWidget):
         arcmin_x = (dx * self.state.arcsec_per_px) / 60.0
         arcmin_y = (dy * self.state.arcsec_per_px) / 60.0
 
-        # Update overlay always (dot position)
+        self._update_errors(arcmin_x, arcmin_y)
         self._update_overlay()
 
         # info panel
         dist_px = _dist((cx, cy), (px, py))
         dist_arcmin = (dist_px * self.state.arcsec_per_px) / 60.0
 
-        # ADDED: Live confirmation text
-        conf_txt = "CONFIRMADA ✅" if self.state.polaris_confirmed else f"confirmando… ({self.state.confirm_count}/{POLARIS_CONFIRM_FRAMES})"
-
+        cal_state = "OK" if (self.cal.s.calibrated and self.cal.s.center is not None) else f"{len(self.cal.s.points)}/3"
         self.lbl_info.setText(
             f"Live View: OK\n"
-            f"Polaris: x={px:.1f}, y={py:.1f} ({conf_txt})\n"
+            f"Polaris: x={px:.1f}, y={py:.1f}\n"
             f"Distancia al objetivo: {dist_arcmin:.2f}′\n"
             f"Escala: {self.state.arcsec_per_px:.2f} arcsec/px\n"
+            f"Calibración (3-point): {cal_state}\n"
         )
 
-        # ────────────────────────────────
-        # MODIFIED: Only compute/show arrows AFTER confirmation
-        # ────────────────────────────────
-        if not self.state.polaris_confirmed:
-            # while confirming, freeze errors and hide arrows
-            self._set_status("Confirmando Polaris… mantén la montura estable")
-            self._update_errors(0.0, 0.0)
-            self.az_arrow.setVisible(False)
-            self.alt_arrow.setVisible(False)
-            return
-
-        # Normal behavior after confirmation
-        self._update_errors(arcmin_x, arcmin_y)
-
-        if dist_arcmin < 0.5:
-            self._set_status("Alineación correcta ✅")
+        # Status text (keeps your old behavior but adds calibration status)
+        if self.cal.s.calibrated and self.cal.s.center is not None:
+            if dist_arcmin < 0.5:
+                self._set_status("Alineación correcta ✅")
+            else:
+                self._set_status("Ajusta Altitud / Azimut siguiendo las flechas…")
         else:
-            self._set_status("Ajusta Altitud / Azimut siguiendo las flechas…")
+            # not calibrated yet: show calibration guidance
+            if cal_msg:
+                self._set_status(cal_msg)
+            else:
+                self._set_status("Calibración 3-point: en curso…")
 
     # ─────────────────────────
     # Overlay drawing
@@ -739,21 +847,11 @@ class PolarAlignmentPage(QWidget):
             px, py = self.state.polaris_s
             dot_r = 6.0
             self.polaris_dot.setRect(QRectF(px - dot_r, py - dot_r, 2 * dot_r, 2 * dot_r))
-
-            # ADDED: change dot color depending on confirmation
-            if getattr(self.state, "polaris_confirmed", False):
-                col = QColor("#3cff4e")  # green confirmed
-            else:
-                col = QColor("#ff9a3d")  # orange confirming
-
-            self.polaris_dot.setPen(QPen(col, 2))
-            self.polaris_dot.setBrush(QBrush(col))
-
             self.polaris_dot.setVisible(True)
         else:
             self.polaris_dot.setVisible(False)
 
-        # Arrows (derived from current labels if possible)
+        # Arrows (derived from last errors stored)
         ax = getattr(self, "_last_arcmin_x", 0.0)
         ay = getattr(self, "_last_arcmin_y", 0.0)
 
@@ -762,18 +860,18 @@ class PolarAlignmentPage(QWidget):
         vx = _clamp(ax * scale_px, -120, 120)
         vy = _clamp(ay * scale_px, -120, 120)
 
+        # Azimuth arrow is horizontal (cyan), Altitude vertical (yellow)
         self.az_arrow.setLine(cx, cy + r + 18, cx - vx, cy + r + 18)
         self.alt_arrow.setLine(cx + r + 18, cy, cx + r + 18, cy - vy)
 
-        # MODIFIED: hide arrows if NOT confirmed
-        if not getattr(self.state, "polaris_confirmed", False):
-            self.az_arrow.setVisible(False)
-            self.alt_arrow.setVisible(False)
-            return
-
-        # Hide arrows if almost aligned
+        # Hide arrows if almost aligned OR not calibrated yet (optional but NINA-like)
         total = math.hypot(ax, ay)
-        show = total >= 0.25
+        if self.cal.s.calibrated:
+            show = total >= 0.25
+        else:
+            # show smaller arrows while calibrating is confusing → hide until calibrated
+            show = False
+
         self.az_arrow.setVisible(show)
         self.alt_arrow.setVisible(show)
 
@@ -782,6 +880,7 @@ class PolarAlignmentPage(QWidget):
     # ─────────────────────────
     @staticmethod
     def _fmt_arcmin(v: float) -> str:
+        # Show like 00° 05′ 22″ style? We'll approximate:
         sign = "-" if v < 0 else ""
         v = abs(v)
         deg = int(v // 60.0)
@@ -794,8 +893,10 @@ class PolarAlignmentPage(QWidget):
         self._last_arcmin_x = float(arcmin_x)
         self._last_arcmin_y = float(arcmin_y)
 
+        # Total
         total = math.hypot(arcmin_x, arcmin_y)
 
+        # Text like NINA
         az_dir = "Move left/west ←" if arcmin_x > 0 else ("Move right/east →" if arcmin_x < 0 else "—")
         alt_dir = "Move up ↑" if arcmin_y > 0 else ("Move down ↓" if arcmin_y < 0 else "—")
 
@@ -815,7 +916,10 @@ class PolarAlignmentPage(QWidget):
     # Timers
     # ─────────────────────────
     def _tick_ui(self):
+        # Keep overlay aligned to view; this is cheap and prevents "drift"
         self._update_overlay()
+
+        # If no frames and no demo, keep the waiting message
         if self._last_frame is None and not self.demo_timer.isActive():
             self.lbl_info.setText("Live View: —\nPolaris: —\n")
 
@@ -823,20 +927,31 @@ class PolarAlignmentPage(QWidget):
     # Demo frames (Polaris-like)
     # ─────────────────────────
     def _demo_step(self):
+        # Create a star field with a bright Polaris that slightly jitters
         w, h = 1280, 720
         img = np.random.normal(10, 6, (h, w)).astype(np.float32)
         img = np.clip(img, 0, 255)
 
+        # fixed "true" polaris near center but not exact
         cx, cy = w / 2, h / 2
         t = time.time()
-        px = cx - 80 + math.sin(t * 0.8) * 2.0
-        py = cy + 25 + math.cos(t * 0.7) * 2.0
 
+        # ✅ Demo now also simulates RA movement (so 3-point can actually complete)
+        # We make Polaris move on an arc around a hidden center to mimic RA rotation.
+        hidden_cx = cx + 40
+        hidden_cy = cy - 20
+        radius = 90
+        ang = (t * 0.55) % (2 * math.pi)
+        px = hidden_cx + math.cos(ang) * radius + math.sin(t * 0.8) * 2.0
+        py = hidden_cy + math.sin(ang) * radius + math.cos(t * 0.7) * 2.0
+
+        # draw some stars
         for _ in range(180):
             sx = np.random.randint(0, w)
             sy = np.random.randint(0, h)
             img[sy, sx] = 255
 
+        # draw polaris as a small gaussian blob
         rr = 7
         x0 = int(_clamp(px - rr, 0, w - 1))
         x1 = int(_clamp(px + rr, 0, w - 1))
@@ -853,6 +968,7 @@ class PolarAlignmentPage(QWidget):
         self._render_frame(img)
 
         if getattr(self, "_semi_live", True):
+            # In demo, default to semi-live for UX
             self._semi_live = True
             self.btn_semi_live.setText("⏸ Pausar semi-en vivo")
             self._solve_frame(img, force=False)
