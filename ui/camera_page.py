@@ -553,6 +553,9 @@ class CameraPage(QWidget):
         self._video_frames: list[np.ndarray] = []
         self._video_capture_end_ts: float = 0.0
 
+        # ───── Carpeta de capturas (FireCapture style)
+        self._capture_dir = os.path.join(os.getcwd(), "captures")
+        os.makedirs(self._capture_dir, exist_ok=True)
 
         self._build_ui()
         self._wire_ui()
@@ -643,10 +646,16 @@ class CameraPage(QWidget):
         self.btn_capture_dedicated = QPushButton("📸 Captura dedicada")
         self.btn_capture_dedicated.setToolTip("Captura con exposición dedicada (Live View continúa)")
 
+        #Carpeta almacenamiento captura
+        self.btn_capture_dir = QPushButton("📁 Carpeta de capturas")
+        self.btn_capture_dir.setToolTip("Seleccionar carpeta donde guardar los vídeos")
+
+
         gl.addWidget(self.btn_start, 0, 0, 1, 2)
         gl.addWidget(self.btn_stop, 0, 2, 1, 1)
         gl.addWidget(self.btn_project, 1, 0, 1, 3)
         gl.addWidget(self.btn_capture_dedicated, 2, 0, 1, 3)
+        gl.addWidget(self.btn_capture_dir, 3, 0, 1, 3)
 
         l.addWidget(gb_live)
 
@@ -766,6 +775,9 @@ class CameraPage(QWidget):
 
         # captura dedicada
         self.btn_capture_dedicated.clicked.connect(self.on_capture_dedicated)
+
+        # Directorio de Captura
+        self.btn_capture_dir.clicked.connect(self.select_capture_directory)
 
         # gain sync
         self.sl_gain.valueChanged.connect(self.sp_gain.setValue)
@@ -927,11 +939,6 @@ class CameraPage(QWidget):
         self._capture_running = True
         self._video_capture_end_ts = time.time() + duration
 
-        QMessageBox.information(
-            self,
-            "Captura iniciada",
-            f"Capturando vídeo durante {duration:.2f} s"
-        )
 
 
     def save_avi(self, frames: list[np.ndarray], path: str, fps: int = 30):
@@ -1008,7 +1015,7 @@ class CameraPage(QWidget):
         os.makedirs(out_dir, exist_ok=True)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(out_dir, f"capture_{ts}.png")
+        path = os.path.join(self._capture_dir, f"capture_{ts}.png")
 
         try:
             qimg = _qimage_from_ndarray(frame)
@@ -1077,7 +1084,7 @@ class CameraPage(QWidget):
         os.makedirs(out_dir, exist_ok=True)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(out_dir, f"capture_{ts}.avi")
+        path = os.path.join(self._capture_dir, f"capture_{ts}.avi")
 
         self.save_avi(frames, path, fps=fps_real)
 
@@ -1087,5 +1094,19 @@ class CameraPage(QWidget):
             f"Vídeo guardado:\n{path}\n"
             f"Frames: {len(frames)} | FPS: {fps_real}"
         )
+
+    def select_capture_directory(self):
+        from PySide6.QtWidgets import QFileDialog
+
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Seleccionar carpeta de capturas",
+            self._capture_dir,
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+
+        if path:
+            self._capture_dir = path
+            os.makedirs(self._capture_dir, exist_ok=True)
 
 
