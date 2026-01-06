@@ -1,114 +1,71 @@
 # ui/camera_page.py
 # CameraPage (NINA-ish shell + FireCapture-ish LiveView)
 # - NO depende de fps kw en LiveViewService.start()
-# - NO usa FrameBus.instance() (en tu proyecto FrameBus es una función / factory)
+# - NO usa FrameBus.instance()
 # - Si no hay ZWO, usa simulador sin crashear
-# - Live View con overlay (crosshair + grid + texto), zoom tipo FireCapture, ROI básico,
-#   controles de exposición/ganancia, histograma, y botón para proyectar a otra pantalla (LIVE_VIEW_PROJECTOR.py)
+# - Live View con overlay, zoom, ROI, histograma, proyector
+# - 🆕 Captura dedicada con Live View activo (MODELO B)
 
 from __future__ import annotations
 
 import time
 import math
+import os
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import cv2
 import numpy as np
 
-from PySide6.QtCore import Qt, QObject, Signal, QTimer, QRect, QSize, QPoint
-from PySide6.QtGui import (
-    QColor,
-    QFont,
-    QImage,
-    QPainter,
-    QPen,
-    QPixmap,
-    QAction,
-)
+from PySide6.QtCore import Qt, QObject, Signal, QTimer, QRect, QSize, QPoint, QThread
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QLabel,
-    QPushButton,
-    QFrame,
-    QComboBox,
-    QSpinBox,
-    QDoubleSpinBox,
-    QCheckBox,
-    QSlider,
-    QSplitter,
-    QSizePolicy,
-    QMessageBox,
-    QGroupBox,
-    QGridLayout,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
+    QSpinBox, QDoubleSpinBox, QCheckBox, QSlider, QSplitter,
+    QSizePolicy, QMessageBox, QGroupBox, QGridLayout
 )
 
-# ─────────────────────────────────────────────
-# Optional imports (no romper si faltan)
-# ─────────────────────────────────────────────
 try:
-    from camera.zwo_camera import ZWOCameraManager  # tu fichero: camera/zwo_camera.py
+    from camera.zwo_camera import ZWOCameraManager
 except Exception:
     ZWOCameraManager = None
 
-# Tu proyecto tiene camera/frame_bus.py. A veces FrameBus es una función (factory/singleton).
+
 def _get_frame_bus():
     try:
-        from camera.frame_bus import FrameBus  # type: ignore
-        # Si FrameBus es función: FrameBus()
-        # Si fuera clase: FrameBus() también
+        from camera.frame_bus import FrameBus
         return FrameBus()
     except Exception:
         return None
 
-# Botón para proyectar live view
+
 try:
-    from LIVE_VIEW_PROJECTOR import LiveViewProjector  # noqa: N813
+    from LIVE_VIEW_PROJECTOR import LiveViewProjector
 except Exception:
     LiveViewProjector = None
 
 
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
 def _qimage_from_ndarray(frame: np.ndarray) -> QImage:
-    """
-    Soporta:
-      - Gray HxW uint8/uint16/float
-      - RGB/RGBA HxWx3/4 uint8
-
-    FIX: fuerza memoria C-contigua para evitar
-    BufferError: underlying buffer is not C-contiguous
-    """
     if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
         return QImage()
 
-    # 🔑 FIX CRÍTICO
     arr = np.ascontiguousarray(frame)
 
     if arr.dtype != np.uint8:
         a = arr.astype(np.float32)
         a -= float(np.min(a)) if a.size else 0.0
         mx = float(np.max(a)) if a.size else 1.0
-        if mx <= 0:
-            mx = 1.0
-        a = (a / mx) * 255.0
+        a = (a / max(mx, 1e-6)) * 255.0
         arr = np.clip(a, 0, 255).astype(np.uint8)
 
     if arr.ndim == 2:
         h, w = arr.shape
-        qimg = QImage(arr.data, w, h, w, QImage.Format_Grayscale8)
-        return qimg.copy()
+        return QImage(arr.data, w, h, w, QImage.Format_Grayscale8).copy()
 
-    if arr.ndim == 3:
-        h, w, ch = arr.shape
-        if ch == 3:
-            qimg = QImage(arr.data, w, h, w * 3, QImage.Format_RGB888)
-            return qimg.copy()
-        if ch == 4:
-            qimg = QImage(arr.data, w, h, w * 4, QImage.Format_RGBA8888)
-            return qimg.copy()
+    if arr.ndim == 3 and arr.shape[2] == 3:
+        h, w, _ = arr.shape
+        return QImage(arr.data, w, h, w * 3, QImage.Format_RGB888).copy()
 
     return QImage()
 
@@ -117,150 +74,183 @@ def _clamp(v: int, a: int, b: int) -> int:
     return max(a, min(b, v))
 
 
-# ─────────────────────────────────────────────
-# Simulated Camera (fallback)
-# ─────────────────────────────────────────────
 class SimulatedCameraManager:
-    """
-    Simulador que genera frames tipo "astronomía" (estrellas + ruido + un objeto brillante).
-    Implementa lo mínimo que el UI necesita: start_live/stop_live/get_frame/set_gain/set_exposure/set_roi.
-    """
-
     def __init__(self):
         self.sdk_available = False
         self.camera_connected = False
         self._t0 = time.time()
-
         self._gain = 120
         self._exposure_ms = 20.0
-        self._roi = None  # (x,y,w,h)
+        self._roi = None
         self._w = 1280
         self._h = 720
 
-    def start_live(self):
-        return True
-
-    def stop_live(self):
-        return True
-
-    def set_gain(self, value: int):
-        self._gain = int(value)
-
-    def set_exposure(self, ms: float):
-        self._exposure_ms = float(ms)
-
-    def set_roi(self, x: int, y: int, w: int, h: int):
-        self._roi = (int(x), int(y), int(w), int(h))
+    def start_live(self): return True
+    def stop_live(self): return True
+    def set_gain(self, v: int): self._gain = int(v)
+    def set_exposure(self, ms: float): self._exposure_ms = float(ms)
+    def set_roi(self, x, y, w, h): self._roi = (x, y, w, h)
 
     def get_frame(self):
         w, h = self._w, self._h
         img = np.random.normal(10, 6, (h, w)).astype(np.float32)
 
-        # estrellas
-        nstars = 250
-        xs = np.random.randint(0, w, size=nstars)
-        ys = np.random.randint(0, h, size=nstars)
-        img[ys, xs] += np.random.uniform(120, 220, size=nstars)
+        xs = np.random.randint(0, w, 250)
+        ys = np.random.randint(0, h, 250)
+        img[ys, xs] += np.random.uniform(120, 220, 250)
 
-        # "objeto" brillante que deriva un poco
         t = time.time() - self._t0
         cx = w * 0.52 + math.sin(t * 0.35) * 20
         cy = h * 0.48 + math.cos(t * 0.28) * 12
 
-        rr = 9
-        x0 = _clamp(int(cx - rr), 0, w - 1)
-        x1 = _clamp(int(cx + rr), 0, w - 1)
-        y0 = _clamp(int(cy - rr), 0, h - 1)
-        y1 = _clamp(int(cy + rr), 0, h - 1)
+        for yy in range(int(cy - 8), int(cy + 8)):
+            for xx in range(int(cx - 8), int(cx + 8)):
+                if 0 <= xx < w and 0 <= yy < h:
+                    img[yy, xx] += 200
 
-        for yy in range(y0, y1 + 1):
-            for xx in range(x0, x1 + 1):
-                d2 = (xx - cx) ** 2 + (yy - cy) ** 2
-                img[yy, xx] += 250 * math.exp(-d2 / (2 * 2.3**2))
-
-        # "ganancia" y "exposición" influyen (simple)
-        gain_scale = 0.6 + (self._gain / 300.0)
-        exp_scale = 0.7 + (self._exposure_ms / 80.0)
-        img *= (gain_scale * exp_scale)
-
+        img *= (0.6 + self._gain / 300.0) * (0.7 + self._exposure_ms / 80.0)
         img = np.clip(img, 0, 255).astype(np.uint8)
 
-        # ROI recorte
-        if self._roi is not None:
+        if self._roi:
             x, y, rw, rh = self._roi
-            x = _clamp(x, 0, w - 2)
-            y = _clamp(y, 0, h - 2)
-            rw = _clamp(rw, 16, w - x)
-            rh = _clamp(rh, 16, h - y)
-            img = img[y : y + rh, x : x + rw]
+            img = img[y:y + rh, x:x + rw]
 
         return img
 
+    # 🆕 CAPTURA DEDICADA
+    def capture(self, exposure_ms: float):
+        time.sleep(exposure_ms / 1000.0)
+        return self.get_frame()
 
-# ─────────────────────────────────────────────
-# LiveViewService (QTimer en hilo UI)
-# ─────────────────────────────────────────────
+
 class LiveViewService(QObject):
-    frame_ready = Signal(object)  # np.ndarray
+    frame_ready = Signal(object)
 
-    def __init__(self, cam_manager, parent=None):
+    def __init__(self, cam, parent=None):
         super().__init__(parent)
-        self.cam = cam_manager
-        self.timer = QTimer(self)  # IMPORTANTE: creado en hilo UI
+        self.cam = cam
+        self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self._running = False
 
-    def start(self, fps: int = 12):
-        # compat con llamadas antiguas:
-        #   start(fps=12)  -> OK
-        #   start(12)      -> OK
-        try:
-            fps = int(fps)
-        except Exception:
-            fps = 12
-        fps = max(1, min(60, fps))
-        interval = int(1000 / fps)
-
+    def start(self, fps=12):
         if self._running:
             return True
-
-        ok = True
-        try:
-            if hasattr(self.cam, "start_live"):
-                self.cam.start_live()
-        except Exception:
-            ok = False
-
         self._running = True
-        self.timer.start(interval)
-        return ok
+        self.cam.start_live()
+        self.timer.start(int(1000 / max(1, min(60, int(fps)))))
+        return True
 
     def stop(self):
         if not self._running:
             return True
         self.timer.stop()
         self._running = False
-        try:
-            if hasattr(self.cam, "stop_live"):
-                self.cam.stop_live()
-        except Exception:
-            pass
+        self.cam.stop_live()
         return True
-
-    def is_running(self) -> bool:
-        return self._running
 
     def _tick(self):
         try:
-            frame = None
-            if hasattr(self.cam, "get_frame"):
-                frame = self.cam.get_frame()
-            if frame is None:
-                return
-            self.frame_ready.emit(frame)
+            frame = self.cam.get_frame()
+            if frame is not None:
+                self.frame_ready.emit(frame)
         except Exception:
-            # evitar crasheos por excepciones en timer
-            return
+            pass
+
+# ─────────────────────────────────────────────
+# CameraWorker para no bloquear el LiveView
+# ─────────────────────────────────────────────
+
+class CaptureWorker(QObject):
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, cam, exposure_s):
+        super().__init__()
+        self.cam = cam
+        self.exposure_s = exposure_s
+
+    def run(self):
+        try:
+            # Simulador
+            if hasattr(self.cam, "capture"):
+                frame = self.cam.capture(self.exposure_s * 1000.0)
+
+            # ZWO REAL (modelo FireCapture)
+            else:
+                frame = self._zwo_firecapture_like()
+
+            self.finished.emit(frame)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+# ─────────────────────────────────────────────
+# VideoCaptureWorker para capturar largas exposiciones
+# ─────────────────────────────────────────────
+
+class VideoCaptureWorker(QObject):
+    finished = Signal(list)
+    error = Signal(str)
+
+    def __init__(self, duration_s: float):
+        super().__init__()
+        self.duration_s = duration_s
+        self._frames = []
+        self._running = True
+
+    def push_frame(self, frame: np.ndarray):
+        if self._running:
+            self._frames.append(frame.copy())
+
+    def run(self):
+        try:
+            t0 = time.time()
+            while time.time() - t0 < self.duration_s:
+                time.sleep(0.01)
+            self._running = False
+            self.finished.emit(self._frames)
+        except Exception as e:
+            self.error.emit(str(e))
+
+# ─────────────────────────────────────────────
+# AVISaveWorker para guardar los videos
+# ─────────────────────────────────────────────          
+
+class AviSaveWorker(QObject):
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, frames, path, fps):
+        super().__init__()
+        self.frames = frames
+        self.path = path
+        self.fps = fps
+
+    def run(self):
+        try:
+            h, w = self.frames[0].shape[:2]
+            writer = cv2.VideoWriter(
+                self.path,
+                cv2.VideoWriter_fourcc(*"MJPG"),
+                self.fps,
+                (w, h),
+                True
+            )
+
+            if not writer.isOpened():
+                raise RuntimeError("No se pudo abrir el writer AVI")
+
+            for f in self.frames:
+                if f.ndim == 2:
+                    f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
+                writer.write(f)
+
+            writer.release()
+            self.finished.emit()
+
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 # ─────────────────────────────────────────────
@@ -390,7 +380,7 @@ class LiveViewWidget(QWidget):
         if iw <= 0 or ih <= 0:
             return
 
-        # calcular escala
+        # escala
         if self._fit:
             s = min(vw / iw, vh / ih)
         else:
@@ -405,42 +395,47 @@ class LiveViewWidget(QWidget):
 
         p.drawPixmap(target, self._pix)
 
-        # overlay
         p.setRenderHint(QPainter.Antialiasing, True)
 
+        # grid
         if self.overlay.grid:
-            pen = QPen(QColor(255, 255, 255, 35), 1)
-            p.setPen(pen)
-            # 3x3 grid
+            p.setPen(QPen(QColor(255, 255, 255, 35), 1))
             for k in (1, 2):
                 gx = x + (dw * k) // 3
                 gy = y + (dh * k) // 3
                 p.drawLine(gx, y, gx, y + dh)
                 p.drawLine(x, gy, x + dw, gy)
 
+        # crosshair
         if self.overlay.crosshair:
-            pen = QPen(QColor(255, 255, 255, 90), 1)
-            p.setPen(pen)
+            p.setPen(QPen(QColor(255, 255, 255, 90), 1))
             cx = x + dw // 2
             cy = y + dh // 2
             p.drawLine(cx, y, cx, y + dh)
             p.drawLine(x, cy, x + dw, cy)
 
+        # ROI
         if self.overlay.roi and self._roi_rect is not None:
-            # ROI en coords de imagen -> convertir a coords de pantalla
             rx = x + int(self._roi_rect.x() * s)
             ry = y + int(self._roi_rect.y() * s)
             rw = int(self._roi_rect.width() * s)
             rh = int(self._roi_rect.height() * s)
-            pen = QPen(QColor("#ff9a3d"), 2)
-            p.setPen(pen)
+            p.setPen(QPen(QColor("#ff9a3d"), 2))
             p.drawRect(QRect(rx, ry, rw, rh))
 
+        # info
         if self.overlay.info:
             p.setPen(QColor("#cfd6dd"))
             p.setFont(QFont("Segoe UI", 10, QFont.Bold))
             txt = f"Zoom: {('Fit' if self._fit else f'{self._zoom:.2f}x')}   FPS: {self._fps:.1f}"
             p.drawText(12, 22, txt)
+
+        # 🆕 overlay captura dedicada (MODELO B)
+        parent = self.parent()
+        if parent is not None and getattr(parent, "_capture_running", False):
+            p.setPen(QColor("#ffcc66"))
+            p.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            p.drawText(12, 42, "LIVE (preview) — Capturando exposición dedicada")
 
 
 # ─────────────────────────────────────────────
@@ -450,7 +445,7 @@ class HistogramWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.setMinimumHeight(120)
-        self._hist = None  # np.ndarray shape (256,)
+        self._hist = None
         self._min = 0
         self._max = 255
 
@@ -460,16 +455,12 @@ class HistogramWidget(QWidget):
             self.update()
             return
 
-        if frame.ndim == 3:
-            g = frame[..., 0]
-        else:
-            g = frame
+        g = frame[..., 0] if frame.ndim == 3 else frame
 
         if g.dtype != np.uint8:
             a = g.astype(np.float32)
             a -= float(np.min(a))
-            mx = float(np.max(a))
-            mx = mx if mx > 0 else 1.0
+            mx = float(np.max(a)) or 1.0
             g = np.clip((a / mx) * 255.0, 0, 255).astype(np.uint8)
 
         hist = np.bincount(g.ravel(), minlength=256).astype(np.float32)
@@ -485,7 +476,6 @@ class HistogramWidget(QWidget):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor("#101318"))
 
-        # marco
         p.setPen(QColor("#23262d"))
         p.drawRect(self.rect().adjusted(0, 0, -1, -1))
 
@@ -498,10 +488,7 @@ class HistogramWidget(QWidget):
         w = self.width()
         h = self.height()
 
-        # barras
-        pen = QPen(QColor(220, 230, 245, 170), 1)
-        p.setPen(pen)
-
+        p.setPen(QPen(QColor(220, 230, 245, 170), 1))
         for i in range(256):
             x = int(i * (w / 256.0))
             v = float(self._hist[i])
@@ -509,12 +496,9 @@ class HistogramWidget(QWidget):
             y1 = int((h - 20) * (1.0 - v))
             p.drawLine(x, y0, x, y1)
 
-        # texto min/max
         p.setPen(QColor("#8b95a3"))
         p.setFont(QFont("Segoe UI", 9, QFont.Bold))
         p.drawText(8, 16, f"Min {self._min}  Max {self._max}")
-
-
 # ─────────────────────────────────────────────
 # CameraPage
 # ─────────────────────────────────────────────
@@ -523,6 +507,25 @@ class CameraPage(QWidget):
     Página de cámara (solo esta página estilo FireCapture en el live view).
     Mantiene la shell NINA del MainWindow (QSS global).
     """
+
+    def _get_camera_state(self):
+        return {
+            "exp": float(self.sp_exp.value()),
+            "gain": int(self.sp_gain.value()),
+            "roi": self._roi_rect if self._roi_enabled else None,
+        }
+
+    def _restore_camera_state(self, state):
+        try:
+            self.cam_manager.set_exposure(state["exp"])
+            self.cam_manager.set_gain(state["gain"])
+            if state["roi"] is not None:
+                r = state["roi"]
+                self.cam_manager.set_roi(r.x(), r.y(), r.width(), r.height())
+            else:
+                self.cam_manager.set_roi(0, 0, 999999, 999999)
+        except Exception:
+            pass
 
     def __init__(self, cam_manager=None):
         super().__init__()
@@ -540,9 +543,16 @@ class CameraPage(QWidget):
 
         # estado ROI
         self._roi_enabled = False
-        self._roi_rect = QRect(0, 0, 0, 0)  # coords imagen
+        self._roi_rect = QRect(0, 0, 0, 0)
 
+        # estado captura dedicada
+        self._capture_running = False
         self._last_frame: Optional[np.ndarray] = None
+
+        # ───── Estado captura de vídeo (FireCapture style)
+        self._video_frames: list[np.ndarray] = []
+        self._video_capture_end_ts: float = 0.0
+
 
         self._build_ui()
         self._wire_ui()
@@ -553,19 +563,15 @@ class CameraPage(QWidget):
         if cam_manager is not None:
             return cam_manager
 
-        # Intentar ZWO
         if ZWOCameraManager is not None:
             try:
                 z = ZWOCameraManager()
-                # si SDK disponible pero sin cámara -> simulador
                 if getattr(z, "sdk_available", False) and not getattr(z, "camera_connected", False):
                     self.no_camera_detected = True
                     return SimulatedCameraManager()
-                # si SDK no disponible -> simulador
                 if not getattr(z, "sdk_available", False):
                     self.no_camera_detected = True
                     return SimulatedCameraManager()
-                # cámara real conectada
                 return z
             except Exception:
                 self.no_camera_detected = True
@@ -577,6 +583,19 @@ class CameraPage(QWidget):
     # ─────────────────────────
     # UI
     # ─────────────────────────
+
+    def _on_capture_done(self, frame: np.ndarray):
+        self._capture_running = False
+
+        self.live_view.set_frame(frame)
+        self.hist.set_frame(frame)
+
+        self._save_captured_frame(frame)
+
+    def _on_capture_error(self, msg: str):
+        self._capture_running = False
+        QMessageBox.critical(self, "Error en captura", msg)
+
     def _build_ui(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -598,14 +617,14 @@ class CameraPage(QWidget):
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
 
-        # left panel controls
+        # ───── Left panel
         self.left = self._card()
         self.left.setFixedWidth(340)
         l = QVBoxLayout(self.left)
         l.setContentsMargins(12, 12, 12, 12)
         l.setSpacing(12)
 
-        # live controls
+        # ───── Live View controls
         gb_live = QGroupBox("Live View")
         gb_live.setStyleSheet("QGroupBox{font-weight:700;}")
         gl = QGridLayout(gb_live)
@@ -618,88 +637,97 @@ class CameraPage(QWidget):
         self.btn_stop.setEnabled(False)
 
         self.btn_project = QPushButton("🖥 Proyectar Live View")
-        self.btn_project.setToolTip("Abre el proyector en otra pantalla (LIVE_VIEW_PROJECTOR.PY)")
+        self.btn_project.setToolTip("Abre el proyector en otra pantalla")
+
+        # 🆕 Captura dedicada
+        self.btn_capture_dedicated = QPushButton("📸 Captura dedicada")
+        self.btn_capture_dedicated.setToolTip("Captura con exposición dedicada (Live View continúa)")
 
         gl.addWidget(self.btn_start, 0, 0, 1, 2)
         gl.addWidget(self.btn_stop, 0, 2, 1, 1)
         gl.addWidget(self.btn_project, 1, 0, 1, 3)
+        gl.addWidget(self.btn_capture_dedicated, 2, 0, 1, 3)
 
         l.addWidget(gb_live)
 
-        # exposure / gain
-        gb_cam = QGroupBox("Cámara")
-        gb_cam.setStyleSheet("QGroupBox{font-weight:700;}")
-        gc = QGridLayout(gb_cam)
+        # ───── Captura dedicada
+        gb_cap = QGroupBox("Captura dedicada")
+        gb_cap.setStyleSheet("QGroupBox{font-weight:700;}")
+        gc = QGridLayout(gb_cap)
         gc.setContentsMargins(10, 10, 10, 10)
         gc.setHorizontalSpacing(10)
         gc.setVerticalSpacing(8)
 
-        gc.addWidget(QLabel("Exposición (ms)"), 0, 0)
+        gc.addWidget(QLabel("Exposición (s)"), 0, 0)
+        self.sp_cap_exp = QDoubleSpinBox()
+        self.sp_cap_exp.setRange(0.01, 3600.0)
+        self.sp_cap_exp.setDecimals(2)
+        self.sp_cap_exp.setValue(5.0)
+        self.sp_cap_exp.setSuffix(" s")
+        gc.addWidget(self.sp_cap_exp, 0, 1, 1, 2)
+
+        l.addWidget(gb_cap)
+
+        # ───── Exposure / gain
+        gb_cam = QGroupBox("Cámara")
+        gb_cam.setStyleSheet("QGroupBox{font-weight:700;}")
+        gc2 = QGridLayout(gb_cam)
+        gc2.setContentsMargins(10, 10, 10, 10)
+        gc2.setHorizontalSpacing(10)
+        gc2.setVerticalSpacing(8)
+
+        gc2.addWidget(QLabel("Exposición (ms)"), 0, 0)
         self.sp_exp = QDoubleSpinBox()
         self.sp_exp.setRange(0.1, 60000.0)
-        self.sp_exp.setSingleStep(1.0)
         self.sp_exp.setValue(20.0)
         self.sp_exp.setSuffix(" ms")
-        gc.addWidget(self.sp_exp, 0, 1, 1, 2)
+        gc2.addWidget(self.sp_exp, 0, 1, 1, 2)
 
-        gc.addWidget(QLabel("Ganancia"), 1, 0)
+        gc2.addWidget(QLabel("Ganancia"), 1, 0)
         self.sl_gain = QSlider(Qt.Horizontal)
         self.sl_gain.setRange(0, 300)
         self.sl_gain.setValue(120)
         self.sp_gain = QSpinBox()
         self.sp_gain.setRange(0, 300)
         self.sp_gain.setValue(120)
-        gc.addWidget(self.sl_gain, 1, 1)
-        gc.addWidget(self.sp_gain, 1, 2)
+
+        gc2.addWidget(self.sl_gain, 1, 1)
+        gc2.addWidget(self.sp_gain, 1, 2)
 
         l.addWidget(gb_cam)
 
-        # ROI
+        # ───── ROI
         gb_roi = QGroupBox("ROI")
         gb_roi.setStyleSheet("QGroupBox{font-weight:700;}")
         gr = QGridLayout(gb_roi)
-        gr.setContentsMargins(10, 10, 10, 10)
-        gr.setHorizontalSpacing(10)
-        gr.setVerticalSpacing(8)
 
         self.chk_roi = QCheckBox("Activar ROI")
         gr.addWidget(self.chk_roi, 0, 0, 1, 3)
 
-        gr.addWidget(QLabel("X"), 1, 0)
-        self.sp_rx = QSpinBox(); self.sp_rx.setRange(0, 99999); self.sp_rx.setValue(0)
-        gr.addWidget(self.sp_rx, 1, 1, 1, 2)
-
-        gr.addWidget(QLabel("Y"), 2, 0)
-        self.sp_ry = QSpinBox(); self.sp_ry.setRange(0, 99999); self.sp_ry.setValue(0)
-        gr.addWidget(self.sp_ry, 2, 1, 1, 2)
-
-        gr.addWidget(QLabel("W"), 3, 0)
+        self.sp_rx = QSpinBox(); self.sp_rx.setRange(0, 99999)
+        self.sp_ry = QSpinBox(); self.sp_ry.setRange(0, 99999)
         self.sp_rw = QSpinBox(); self.sp_rw.setRange(16, 99999); self.sp_rw.setValue(640)
-        gr.addWidget(self.sp_rw, 3, 1, 1, 2)
-
-        gr.addWidget(QLabel("H"), 4, 0)
         self.sp_rh = QSpinBox(); self.sp_rh.setRange(16, 99999); self.sp_rh.setValue(480)
-        gr.addWidget(self.sp_rh, 4, 1, 1, 2)
+
+        gr.addWidget(QLabel("X"), 1, 0); gr.addWidget(self.sp_rx, 1, 1, 1, 2)
+        gr.addWidget(QLabel("Y"), 2, 0); gr.addWidget(self.sp_ry, 2, 1, 1, 2)
+        gr.addWidget(QLabel("W"), 3, 0); gr.addWidget(self.sp_rw, 3, 1, 1, 2)
+        gr.addWidget(QLabel("H"), 4, 0); gr.addWidget(self.sp_rh, 4, 1, 1, 2)
 
         self.btn_apply_roi = QPushButton("Aplicar ROI")
         gr.addWidget(self.btn_apply_roi, 5, 0, 1, 3)
 
         l.addWidget(gb_roi)
 
-        # overlay options
+        # ───── Overlay
         gb_ov = QGroupBox("Overlay")
         gb_ov.setStyleSheet("QGroupBox{font-weight:700;}")
         go = QGridLayout(gb_ov)
-        go.setContentsMargins(10, 10, 10, 10)
-        go.setHorizontalSpacing(10)
-        go.setVerticalSpacing(8)
 
-        self.chk_cross = QCheckBox("Crosshair")
-        self.chk_cross.setChecked(True)
-        self.chk_grid = QCheckBox("Grid")
-        self.chk_grid.setChecked(True)
-        self.chk_info = QCheckBox("Info")
-        self.chk_info.setChecked(True)
+        self.chk_cross = QCheckBox("Crosshair"); self.chk_cross.setChecked(True)
+        self.chk_grid = QCheckBox("Grid"); self.chk_grid.setChecked(True)
+        self.chk_info = QCheckBox("Info"); self.chk_info.setChecked(True)
+
         go.addWidget(self.chk_cross, 0, 0)
         go.addWidget(self.chk_grid, 0, 1)
         go.addWidget(self.chk_info, 0, 2)
@@ -707,7 +735,7 @@ class CameraPage(QWidget):
         l.addWidget(gb_ov)
         l.addStretch(1)
 
-        # center panel: live view + histogram bottom
+        # ───── Center panel
         center = QWidget()
         cv = QVBoxLayout(center)
         cv.setContentsMargins(0, 0, 0, 0)
@@ -721,10 +749,7 @@ class CameraPage(QWidget):
 
         splitter.addWidget(self.left)
         splitter.addWidget(center)
-
-        splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([340, 1200])
 
         root.addWidget(splitter, 1)
 
@@ -733,13 +758,14 @@ class CameraPage(QWidget):
         w.setObjectName("Card")
         w.setStyleSheet("QFrame#Card{background:#171a20; border:1px solid #23262d; border-radius:12px;}")
         return w
-
     # ─────────────────────────
     def _wire_ui(self):
         self.btn_start.clicked.connect(self.start_live)
         self.btn_stop.clicked.connect(self.stop_live)
-
         self.btn_project.clicked.connect(self.project_live_view)
+
+        # captura dedicada
+        self.btn_capture_dedicated.clicked.connect(self.on_capture_dedicated)
 
         # gain sync
         self.sl_gain.valueChanged.connect(self.sp_gain.setValue)
@@ -753,7 +779,7 @@ class CameraPage(QWidget):
         self.chk_roi.toggled.connect(self.on_roi_toggled)
         self.btn_apply_roi.clicked.connect(self.apply_roi)
 
-        # overlay toggles
+        # overlay
         self.chk_cross.toggled.connect(self.on_overlay_changed)
         self.chk_grid.toggled.connect(self.on_overlay_changed)
         self.chk_info.toggled.connect(self.on_overlay_changed)
@@ -762,16 +788,14 @@ class CameraPage(QWidget):
     # Status
     # ─────────────────────────
     def _update_camera_status_label(self):
-        # mostrar si es real o sim
         if isinstance(self.cam_manager, SimulatedCameraManager):
             self.lbl_cam_status.setText("Cámara: Simulada")
         else:
-            # ZWO
             ok = getattr(self.cam_manager, "sdk_available", False)
             con = getattr(self.cam_manager, "camera_connected", False)
             if ok and con:
                 self.lbl_cam_status.setText("Cámara: ZWO (conectada)")
-            elif ok and not con:
+            elif ok:
                 self.lbl_cam_status.setText("Cámara: ZWO (0 detectadas) → simulador")
             else:
                 self.lbl_cam_status.setText("Cámara: ZWO (SDK no disponible) → simulador")
@@ -780,11 +804,10 @@ class CameraPage(QWidget):
     # Live controls
     # ─────────────────────────
     def start_live(self):
-        ok = self.live.start(12)  # sin fps= para evitar TypeError si alguien cambia firma
+        ok = self.live.start(12)
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
-        # publicar aviso solo cuando entras aquí (no al inicio de app)
         if isinstance(self.cam_manager, SimulatedCameraManager):
             QMessageBox.information(
                 self,
@@ -792,7 +815,6 @@ class CameraPage(QWidget):
                 "No se ha detectado una cámara ZWO.\n\n"
                 "Se está usando el modo SIMULADO para el Live View."
             )
-
         return ok
 
     def stop_live(self):
@@ -801,22 +823,20 @@ class CameraPage(QWidget):
         self.btn_stop.setEnabled(False)
 
     # ─────────────────────────
+    # Proyector
+    # ─────────────────────────
     def project_live_view(self):
         if LiveViewProjector is None:
             QMessageBox.warning(
                 self,
                 "Proyector no disponible",
-                "No se pudo importar LIVE_VIEW_PROJECTOR.PY.\n"
-                "Asegúrate de que existe y expone la clase LiveViewProjector."
+                "No se pudo importar LIVE_VIEW_PROJECTOR.PY."
             )
             return
 
-        # Abrimos una ventana proyector y le vamos pasando frames
         self._projector = LiveViewProjector()
         self._projector.show()
 
-        # si el proyector tiene método set_frame, lo usamos.
-        # si no, evitamos crashear.
         def _push(frame):
             try:
                 if hasattr(self._projector, "set_frame"):
@@ -825,7 +845,7 @@ class CameraPage(QWidget):
                 pass
 
         try:
-            self.live.frame_ready.disconnect(_push)  # type: ignore
+            self.live.frame_ready.disconnect(_push)
         except Exception:
             pass
         self.live.frame_ready.connect(_push)
@@ -853,10 +873,8 @@ class CameraPage(QWidget):
     def on_roi_toggled(self, enabled: bool):
         self._roi_enabled = bool(enabled)
         if not self._roi_enabled:
-            # desactivar ROI en cámara
             try:
                 if hasattr(self.cam_manager, "set_roi"):
-                    # reset ROI = full frame (para simulador, lo ignorará)
                     self.cam_manager.set_roi(0, 0, 999999, 999999)
             except Exception:
                 pass
@@ -871,11 +889,9 @@ class CameraPage(QWidget):
         w = int(self.sp_rw.value())
         h = int(self.sp_rh.value())
 
-        # guardar rect para overlay (coords imagen)
         self._roi_rect = QRect(x, y, w, h)
         self.live_view.set_roi_rect(self._roi_rect)
 
-        # aplicar al manager
         try:
             if hasattr(self.cam_manager, "set_roi"):
                 self.cam_manager.set_roi(x, y, w, h)
@@ -892,6 +908,128 @@ class CameraPage(QWidget):
         self.live_view.update()
 
     # ─────────────────────────
+    # CAPTURA DEDICADA (MODELO B)
+    # ─────────────────────────
+
+    def push_frame(self, frame):
+        if self._running:
+            self._frames.append(frame.copy())
+            if len(self._frames) % 50 == 0:
+                print("Frames capturados:", len(self._frames))
+
+    def on_capture_dedicated(self):
+        if self._capture_running:
+            return
+
+        duration = float(self.sp_cap_exp.value())
+
+        self._video_frames.clear()
+        self._capture_running = True
+        self._video_capture_end_ts = time.time() + duration
+
+        QMessageBox.information(
+            self,
+            "Captura iniciada",
+            f"Capturando vídeo durante {duration:.2f} s"
+        )
+
+
+    def save_avi(self, frames: list[np.ndarray], path: str, fps: int = 30):
+        if not frames:
+            raise RuntimeError("No hay frames para guardar")
+
+        h, w = frames[0].shape[:2]
+
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        writer = cv2.VideoWriter(path, fourcc, fps, (w, h), isColor=True)
+
+        if not writer.isOpened():
+            raise RuntimeError("No se pudo abrir el writer AVI")
+
+        for f in frames:
+            if f.ndim == 2:
+                f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
+            writer.write(f)
+
+        writer.release()
+
+    # ─────────────────────────
+    # GUARDAR LARGA EXPOSICIÓN EN AVI
+    # ─────────────────────────
+
+    def _on_video_captured(self, frames):
+        self._capture_running = False
+
+        # desconectar captura
+        try:
+            self.live.frame_ready.disconnect(self._cap_worker.push_frame)
+        except Exception:
+            pass
+
+        self._cap_thread.quit()
+        self._cap_thread.wait()
+
+        if not frames:
+            QMessageBox.warning(self, "Captura", "No se capturaron frames.")
+            return
+
+        duration = float(self.sp_cap_exp.value())
+        fps_real = max(1, int(round(len(frames) / duration)))
+
+        out_dir = os.path.join(os.getcwd(), "captures")
+        os.makedirs(out_dir, exist_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(out_dir, f"capture_{ts}.avi")
+
+        # guardar AVI en background
+        self._avi_thread = QThread(self)
+        self._avi_worker = AviSaveWorker(frames, path, fps_real)
+
+        self._avi_worker.moveToThread(self._avi_thread)
+        self._avi_thread.started.connect(self._avi_worker.run)
+        self._avi_worker.finished.connect(self._avi_thread.quit)
+        self._avi_worker.error.connect(
+            lambda e: QMessageBox.critical(self, "Error AVI", e)
+        )
+
+        self._avi_thread.start()
+
+        QMessageBox.information(
+            self,
+            "Captura finalizada",
+            f"Vídeo guardándose:\n{path}\n"
+            f"Frames: {len(frames)} | FPS: {fps_real}"
+        )
+
+
+    def _save_captured_frame(self, frame: np.ndarray):
+        out_dir = os.path.join(os.getcwd(), "captures")
+        os.makedirs(out_dir, exist_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(out_dir, f"capture_{ts}.png")
+
+        try:
+            qimg = _qimage_from_ndarray(frame)
+            if qimg.isNull():
+                raise RuntimeError("Frame inválido")
+            qimg.save(path)
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Error al guardar",
+                f"No se pudo guardar la imagen:\n{e}"
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Captura guardada",
+            f"Imagen guardada en:\n{path}"
+        )
+
+    # ─────────────────────────
     # Frame reception
     # ─────────────────────────
     def on_frame(self, frame):
@@ -899,7 +1037,6 @@ class CameraPage(QWidget):
             return
         if isinstance(frame, dict) and "frame" in frame:
             frame = frame["frame"]
-
         if not isinstance(frame, np.ndarray):
             return
 
@@ -909,9 +1046,46 @@ class CameraPage(QWidget):
         self.live_view.set_frame(frame)
         self.hist.set_frame(frame)
 
-        # Bus para PolarAlignmentPage
+        # 🔥 CAPTURA DE VÍDEO (FireCapture style)
+        if self._capture_running:
+            self._video_frames.append(frame.copy())
+
+            if time.time() >= self._video_capture_end_ts:
+                self._finish_video_capture()
+
+        # Bus
         if self.bus is not None and hasattr(self.bus, "frame_ready"):
             try:
-                self.bus.frame_ready.emit(frame)  # type: ignore
+                self.bus.frame_ready.emit(frame)
             except Exception:
                 pass
+    
+    def _finish_video_capture(self):
+        self._capture_running = False
+
+        frames = self._video_frames.copy()
+        self._video_frames.clear()
+
+        if not frames:
+            QMessageBox.warning(self, "Captura", "No se capturaron frames.")
+            return
+
+        duration = float(self.sp_cap_exp.value())
+        fps_real = max(1, int(round(len(frames) / duration)))
+
+        out_dir = os.path.join(os.getcwd(), "captures")
+        os.makedirs(out_dir, exist_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(out_dir, f"capture_{ts}.avi")
+
+        self.save_avi(frames, path, fps=fps_real)
+
+        QMessageBox.information(
+            self,
+            "Captura finalizada",
+            f"Vídeo guardado:\n{path}\n"
+            f"Frames: {len(frames)} | FPS: {fps_real}"
+        )
+
+
