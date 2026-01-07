@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt, QTimer
 
 from ui.dashboard import DashboardPage
 from ui.camera_page import CameraPage
+from ui.sequence_page import SequencePage
 
 try:
     from ui.polar_alignment_page import PolarAlignmentPage
@@ -143,6 +144,10 @@ class MainWindow(QMainWindow):
 
         self.dashboard_page = DashboardPage()
         self.camera_page = CameraPage()
+        self.sequence_page = SequencePage(
+            self.camera_page.cam_manager,
+            self.camera_page.live
+        )
 
         if PolarAlignmentPage:
             self.polar_page = PolarAlignmentPage()
@@ -160,6 +165,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.dashboard_page)  # 0
         self.pages.addWidget(self.polar_page)      # 1
         self.pages.addWidget(self.camera_page)     # 2
+        self.pages.addWidget(self.sequence_page)   # 3
         self.pages.addWidget(self.settings_page)   # 3
 
         self._go(0, "Dashboard")
@@ -187,11 +193,13 @@ class MainWindow(QMainWindow):
         self.btn_dashboard = icon_btn("🏠", "Dashboard", lambda: self._go(0, "Dashboard"))
         self.btn_polar     = icon_btn("🧭", "Polar Alignment", lambda: self._go(1, "Polar Alignment"))
         self.btn_camera    = icon_btn("📷", "Camera", lambda: self._go(2, "Camera"))
-        self.btn_settings  = icon_btn("⚙", "Settings", lambda: self._go(3, "Settings"))
+        self.btn_sequence    = icon_btn("🎞️​", "Secuencias", lambda: self._go(3, "Secuencias"))
+        self.btn_settings  = icon_btn("⚙", "Settings", lambda: self._go(4, "Settings"))
 
         layout.addWidget(self.btn_dashboard, alignment=Qt.AlignCenter)
         layout.addWidget(self.btn_polar, alignment=Qt.AlignCenter)
         layout.addWidget(self.btn_camera, alignment=Qt.AlignCenter)
+        layout.addWidget(self.btn_sequence, alignment=Qt.AlignCenter)
         layout.addStretch()
         layout.addWidget(self.btn_settings, alignment=Qt.AlignCenter)
 
