@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.live_view_panel import LiveViewPanel
+from ui.live_view_widget import LiveViewWidget
 
 
 # ─────────────────────────────────────────────
@@ -280,6 +281,7 @@ class SequencePage(QWidget):
 
         self.cam = cam_manager
         self.live = live_service
+        self.live_panel = LiveViewPanel()
         self.output_dir: Optional[str] = None
 
         # si quieres capturar con ROI igual que camera_page:
@@ -291,6 +293,9 @@ class SequencePage(QWidget):
         self._build_ui()
         self._wire_live()
         self._wire_ui()
+
+        self.live_panel.live_view.set_color(True)
+        self.live_panel.live_view.set_bayer_pattern("BGGR")
 
     # ───────── UI
     def _build_ui(self):
@@ -391,6 +396,7 @@ class SequencePage(QWidget):
         splitter.addWidget(self.left)
         splitter.addWidget(self.live_panel)
         splitter.setStretchFactor(1, 1)
+        self.live_panel.live_view.set_zoom("MAX")
 
         root.addWidget(splitter, 1)
 

@@ -901,8 +901,22 @@ class CameraPage(QWidget):
         w = int(self.sp_rw.value())
         h = int(self.sp_rh.value())
 
-        self._roi_rect = QRect(x, y, w, h)
-        self.live_view.set_roi_rect(self._roi_rect)
+        # 🔥 Forzar ROI Bayer-aligned
+        x &= ~1
+        y &= ~1
+        w &= ~1
+        h &= ~1
+
+        w = max(w, 16)
+        h = max(h, 16)
+
+        self.sp_rx.setValue(x)
+        self.sp_ry.setValue(y)
+        self.sp_rw.setValue(w)
+        self.sp_rh.setValue(h)
+
+        self.cam_manager.set_roi(x, y, w, h)
+        self.live_view.set_roi_rect(QRect(x, y, w, h))
 
         try:
             if hasattr(self.cam_manager, "set_roi"):

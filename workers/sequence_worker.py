@@ -1,170 +1,192 @@
 import time
 import os
-import cv2
-import numpy as np
+from datetime import datetime
 
+import numpy as np
 from PySide6.QtCore import QObject, Signal
+
+from utils.ser_writer import SERWriter   # 👈 lo creamos después
+import cv2
 
 
 class SequenceWorker(QObject):
     finished = Signal()
     error = Signal(str)
-    progress = Signal(int, int)
+    progress = Signal(int, int)  # actual, total
 
-    def __init__(
-        self,
-        cam,
-        live_service,
-        output_dir: str,
-        cap_type: str,
-        exposure_s: float,
-        gain: int,
-        duration_s: float | None,
-        n_caps: int,
-    ):
+    def __init__(self, cam, params: dict):
         super().__init__()
 
         self.cam = cam
-        self.live = live_service
-        self.output_dir = output_dir
-        self.cap_type = cap_type
-        self.exposure_s = exposure_s
-        self.gain = gain
-        self.duration_s = duration_s
-        self.n_caps = n_caps
-
-        self._frames: list[np.ndarray] = []
+        self.params = params
         self._running = True
 
-    # 🔴 RECIBE FRAMES DEL LIVEVIEW
-    def push_frame(self, frame: np.ndarray):
-        if not self._running:
-            return
+        self._saved_state = {}
 
-        if self.cap_type in ("AVI", "SER"):
-            self._frames.append(frame.copy())
+    # ─────────────────────────────────────────────
+    # Entry point
+    # ─────────────────────────────────────────────
 
-    # 🔴 MÉTODO QUE NO ENCONTRABAS
     def run(self):
         try:
             self._save_camera_state()
             self._apply_capture_settings()
 
-            for i in range(self.n_caps):
+            cap_type = self.params["type"]
+            captures = self.params["captures"]
+
+            for i in range(captures):
                 if not self._running:
                     break
 
-                if self.cap_type in ("AVI", "SER"):
-                    self._capture_video_block(i)
-                else:
-                    self._capture_fits(i)
+                if cap_type == "SER":
+                    self._capture_ser(i + 1)
+                elif cap_type == "AVI":
+                    self._capture_avi(i + 1)
+                elif cap_type == "FITS":
+                    self._capture_fits(i + 1)
 
-                self.progress.emit(i + 1, self.n_caps)
+                self.progress.emit(i + 1, captures)
 
+            self._restore_camera_state()
             self.finished.emit()
 
         except Exception as e:
+            self._restore_camera_state()
             self.error.emit(str(e))
 
-        finally:
-            self._restore_camera_state()
+    def stop(self):
+        self._running = False
 
-    # ─────────────────────────────
-    # CAPTURA VIDEO
-    # ─────────────────────────────
-    def _capture_video_block(self, index: int):
-        self._frames.clear()
-        t_start = None
+    # ─────────────────────────────────────────────
+    # Camera state
+    # ─────────────────────────────────────────────
 
-        while self._running:
-            if self._frames and t_start is None:
-                t_start = time.time()
-
-            if t_start and (time.time() - t_start) >= self.duration_s:
-                break
-
-            time.sleep(0.005)
-
-        if not self._frames:
-            raise RuntimeError("No se capturaron frames")
-
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(
-            self.output_dir,
-            f"seq_{index+1:03d}_{ts}.avi"
-        )
-
-        self._save_avi(self._frames, path)
-
-    # ─────────────────────────────
-    # FITS
-    # ─────────────────────────────
-    def _capture_fits(self, index: int):
-        time.sleep(self.exposure_s)
-
-        if not self._frames:
-            raise RuntimeError("No se recibió frame FITS")
-
-        frame = self._frames[-1]
-
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(
-            self.output_dir,
-            f"seq_{index+1:03d}_{ts}.fits"
-        )
-
-        from astropy.io import fits
-        fits.writeto(path, frame, overwrite=True)
-
-    # ─────────────────────────────
-    # AVI
-    # ─────────────────────────────
-    def _save_avi(self, frames: list[np.ndarray], path: str, fps: int = 30):
-        h, w = frames[0].shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        writer = cv2.VideoWriter(path, fourcc, fps, (w, h), True)
-
-        if not writer.isOpened():
-            raise RuntimeError("No se pudo crear AVI")
-
-        for f in frames:
-            if f.ndim == 2:
-                f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
-            writer.write(f)
-
-        writer.release()
-
-    # ─────────────────────────────
-    # ESTADO CÁMARA
-    # ─────────────────────────────
     def _save_camera_state(self):
         self._saved_state = {
-            "exposure_ms": getattr(self.cam, "_exposure_ms", None),
-            "gain": getattr(self.cam, "_gain", None),
-            "roi": getattr(self.cam, "_roi", None),
+            "exposure_ms": getattr(self.cam, "get_exposure", lambda: None)(),
+            "gain": getattr(self.cam, "get_gain", lambda: None)(),
+            "roi": getattr(self.cam, "get_roi", lambda: None)(),
         }
 
-    def _restore_camera_state(self):
-        st = getattr(self, "_saved_state", None)
-        if not st:
-            return
-
         try:
-            if st["exposure_ms"] is not None:
-                self.cam.set_exposure(st["exposure_ms"])
-            if st["gain"] is not None:
-                self.cam.set_gain(st["gain"])
-            if st["roi"] is not None:
-                x, y, w, h = st["roi"]
-                self.cam.set_roi(x, y, w, h)
+            self.cam.stop_live()
         except Exception:
             pass
 
     def _apply_capture_settings(self):
-        if hasattr(self.cam, "set_exposure"):
-            self.cam.set_exposure(self.exposure_s * 1000.0)
-        if hasattr(self.cam, "set_gain"):
-            self.cam.set_gain(self.gain)
+        exp_ms = self.params["exposure_s"] * 1000.0
+        gain = self.params["gain"]
 
-    def stop(self):
-        self._running = False
+        if hasattr(self.cam, "set_exposure"):
+            self.cam.set_exposure(exp_ms)
+
+        if hasattr(self.cam, "set_gain"):
+            self.cam.set_gain(gain)
+
+    def _restore_camera_state(self):
+        try:
+            if self._saved_state.get("exposure_ms") is not None:
+                self.cam.set_exposure(self._saved_state["exposure_ms"])
+            if self._saved_state.get("gain") is not None:
+                self.cam.set_gain(self._saved_state["gain"])
+            if self._saved_state.get("roi") is not None:
+                self.cam.set_roi(*self._saved_state["roi"])
+
+            self.cam.start_live()
+        except Exception:
+            pass
+
+    # ─────────────────────────────────────────────
+    # SER
+    # ─────────────────────────────────────────────
+
+    def _capture_ser(self, index: int):
+        duration = self.params["duration_s"]
+        out_dir = self.params["output_dir"]
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(out_dir, f"capture_{ts}_{index:03d}.ser")
+
+        writer = None
+
+        t0 = time.time()
+        frame_count = 0
+
+        while time.time() - t0 < duration and self._running:
+            frame = self.cam.capture(self.params["exposure_s"] * 1000.0)
+
+            if frame is None:
+                continue
+
+            if writer is None:
+                h, w = frame.shape[:2]
+                writer = SERWriter(
+                    path=path,
+                    width=w,
+                    height=h,
+                    color=False,
+                    bit_depth=8,
+                    fps=1.0 / self.params["exposure_s"],
+                )
+
+            writer.write(frame)
+            frame_count += 1
+
+        if writer:
+            writer.close()
+
+    # ─────────────────────────────────────────────
+    # AVI
+    # ─────────────────────────────────────────────
+
+    def _capture_avi(self, index: int):
+        duration = self.params["duration_s"]
+        out_dir = self.params["output_dir"]
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(out_dir, f"capture_{ts}_{index:03d}.avi")
+
+        writer = None
+        t0 = time.time()
+
+        while time.time() - t0 < duration and self._running:
+            frame = self.cam.capture(self.params["exposure_s"] * 1000.0)
+
+            if frame is None:
+                continue
+
+            if writer is None:
+                h, w = frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+                writer = cv2.VideoWriter(path, fourcc, 1.0 / self.params["exposure_s"], (w, h), True)
+
+            if frame.ndim == 2:
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+
+            writer.write(frame)
+
+        if writer:
+            writer.release()
+
+    # ─────────────────────────────────────────────
+    # FITS
+    # ─────────────────────────────────────────────
+
+    def _capture_fits(self, index: int):
+        from astropy.io import fits
+
+        out_dir = self.params["output_dir"]
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        path = os.path.join(out_dir, f"capture_{ts}_{index:03d}.fits")
+
+        frame = self.cam.capture(self.params["exposure_s"] * 1000.0)
+
+        if frame is None:
+            raise RuntimeError("Frame FITS vacío")
+
+        hdu = fits.PrimaryHDU(frame)
+        hdu.header["EXPTIME"] = self.params["exposure_s"]
+        hdu.header["GAIN"] = self.params["gain"]
+        hdu.writeto(path, overwrite=True)

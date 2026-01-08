@@ -1,3 +1,5 @@
+# ui/live_view_widget.py
+
 import cv2
 import numpy as np
 
@@ -10,21 +12,35 @@ class LiveViewWidget(QWidget):
     def __init__(self):
         super().__init__()
 
-        self.frame = None
+        self.frame: np.ndarray | None = None
         self.zoom_mode = "100"   # "50", "100", "200", "MAX"
 
         # Overlays
         self.show_crosshair = False
         self.show_grid = False
 
+        # Color / debayer
+        self.show_color = False
+        self.bayer_pattern = "BGGR"
+
         self.setStyleSheet("background-color: black;")
 
     # ─────────────────────────────
     # API pública
     # ─────────────────────────────
-    def update_frame(self, frame: np.ndarray):
+    def set_frame(self, frame: np.ndarray):
+        if frame is None or not isinstance(frame, np.ndarray):
+            return
+
         self.frame = frame
         self.update()
+
+    def set_color(self, enabled: bool):
+        self.show_color = bool(enabled)
+        self.update()
+
+    def set_bayer_pattern(self, pattern: str):
+        self.bayer_pattern = pattern.upper()
 
     def set_zoom(self, mode: str):
         self.zoom_mode = mode
@@ -44,6 +60,68 @@ class LiveViewWidget(QWidget):
         self.update()
 
     # ─────────────────────────────
+    # Debayer
+    # ─────────────────────────────
+    def _debayer(self, frame: np.ndarray) -> np.ndarray:
+        bayer_map = {
+            "RGGB": cv2.COLOR_BayerRG2RGB,
+            "BGGR": cv2.COLOR_BayerBG2RGB,
+            "GRBG": cv2.COLOR_BayerGR2RGB,
+            "GBRG": cv2.COLOR_BayerGB2RGB,
+        }
+
+        code = bayer_map.get(self.bayer_pattern)
+        if code is None:
+            return cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+
+        try:
+            return cv2.cvtColor(frame, code)
+        except Exception:
+            return cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+        
+    # ─────────────────────────────
+    # Auto-Debayer
+    # ─────────────────────────────
+    def auto_bayer_from_frame(self, frame: np.ndarray):
+        # Heurística simple: prueba dos patrones y mira cuál tiene menos dominante amarilla
+        try:
+            rgb1 = cv2.cvtColor(frame, cv2.COLOR_BayerRG2RGB)
+            rgb2 = cv2.cvtColor(frame, cv2.COLOR_BayerBG2RGB)
+
+            mean1 = rgb1.mean(axis=(0, 1))
+            mean2 = rgb2.mean(axis=(0, 1))
+
+            # Si verde domina demasiado → mal patrón
+            if abs(mean1[1] - mean1[2]) < abs(mean2[1] - mean2[2]):
+                self.bayer_pattern = "RGGB"
+            else:
+                self.bayer_pattern = "BGGR"
+        except Exception:
+            pass
+
+    def _auto_detect_bayer(self, frame: np.ndarray):
+        """
+        Detecta si RGGB o BGGR da colores más coherentes.
+        Muy simple pero efectivo (tipo FireCapture).
+        """
+        try:
+            rgb_rggb = cv2.cvtColor(frame, cv2.COLOR_BayerRG2RGB)
+            rgb_bggr = cv2.cvtColor(frame, cv2.COLOR_BayerBG2RGB)
+
+            mean_rggb = rgb_rggb.mean(axis=(0, 1))
+            mean_bggr = rgb_bggr.mean(axis=(0, 1))
+
+            # Patrón correcto = menos dominante amarilla
+            score_rggb = abs(mean_rggb[1] - mean_rggb[2])
+            score_bggr = abs(mean_bggr[1] - mean_bggr[2])
+
+            self.bayer_pattern = "RGGB" if score_rggb < score_bggr else "BGGR"
+
+        except Exception:
+            # fallback seguro
+            self.bayer_pattern = "BGGR"
+
+    # ─────────────────────────────
     # Render FireCapture-like
     # ─────────────────────────────
     def paintEvent(self, event):
@@ -54,8 +132,20 @@ class LiveViewWidget(QWidget):
             painter.end()
             return
 
-        # Imagen
-        rgb = cv2.cvtColor(self.frame, cv2.COLOR_GRAY2RGB)
+        frame = self.frame
+
+        # ── Color / mono
+        if frame.ndim == 2:
+            if self.show_color:
+                rgb = self._debayer(frame)
+            else:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+        else:
+            rgb = frame
+
+        # 🔥 CLAVE
+        rgb = np.ascontiguousarray(rgb)
+
         h, w, _ = rgb.shape
 
         image = QImage(
@@ -68,6 +158,7 @@ class LiveViewWidget(QWidget):
 
         canvas_w = self.width()
         canvas_h = self.height()
+
 
         # ── Zoom FireCapture
         if self.zoom_mode == "50":
@@ -95,7 +186,7 @@ class LiveViewWidget(QWidget):
         painter.drawImage(target, image)
 
         # ─────────────────────────────
-        # OVERLAYS (FireCapture)
+        # OVERLAYS
         # ─────────────────────────────
         pen = QPen(Qt.green)
         pen.setWidth(1)

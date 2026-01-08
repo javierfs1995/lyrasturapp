@@ -1,5 +1,7 @@
 from PySide6.QtWidgets import QWidget, QVBoxLayout
-from ui.camera_page import LiveViewWidget, HistogramWidget
+from ui.live_view_widget import LiveViewWidget
+
+from ui.camera_page import HistogramWidget
 
 class LiveViewPanel(QWidget):
     def __init__(self, parent=None):
