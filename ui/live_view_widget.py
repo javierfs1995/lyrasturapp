@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 from PySide6.QtWidgets import QWidget
-from PySide6.QtGui import QPainter, QImage, QPen
+from PySide6.QtGui import QPainter, QImage, QPen, QFont
 from PySide6.QtCore import Qt, QRect
 
 
@@ -14,6 +14,7 @@ class LiveViewWidget(QWidget):
 
         self.frame: np.ndarray | None = None
         self.zoom_mode = "100"   # "50", "100", "200", "MAX"
+        self.show_wb_info = True
 
         # Overlays
         self.show_crosshair = False
@@ -283,5 +284,26 @@ class LiveViewWidget(QWidget):
                 gy = target.y() + i * target.height() // 3
                 painter.drawLine(gx, target.y(), gx, target.y() + target.height())
                 painter.drawLine(target.x(), gy, target.x() + target.width(), gy)
+
+        
+        # ─────────────────────────────
+        # WHITE BALANCE INFO
+        # ─────────────────────────────
+        if self.show_wb_info:
+            painter.setPen(QPen(Qt.white))
+            painter.setFont(QFont("Segoe UI", 10))
+
+            txt = (
+                f"WB  "
+                f"R {self.wb_r:.2f}  "
+                f"G {self.wb_g:.2f}  "
+                f"B {self.wb_b:.2f}"
+            )
+
+            painter.drawText(
+                target.x() + 10,
+                target.y() + target.height() - 10,
+                txt
+            )
 
         painter.end()

@@ -408,9 +408,8 @@ class SequencePage(QWidget):
 
         l.addWidget(gb_wb)
         
-        self.btn_auto_wb = QPushButton("🎯 Auto WB (ROI)")
+        self.btn_auto_wb = QPushButton("Auto WB (ROI)")
         l.addWidget(self.btn_auto_wb)
-
 
         # Destino
         gb_out = QGroupBox("Destino")
