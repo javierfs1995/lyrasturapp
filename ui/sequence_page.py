@@ -21,11 +21,10 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFrame, QGroupBox, QGridLayout,
     QSpinBox, QDoubleSpinBox, QSplitter,
-    QFileDialog, QMessageBox, QComboBox
+    QFileDialog, QMessageBox, QComboBox, QSlider
 )
 
 from ui.live_view_panel import LiveViewPanel
-from ui.live_view_widget import LiveViewWidget
 
 
 # ─────────────────────────────────────────────
@@ -53,7 +52,6 @@ def _to_bgr(frame: np.ndarray) -> np.ndarray:
         return frame
     if frame.ndim == 3 and frame.shape[2] == 4:
         return frame[:, :, :3]
-    # fallback raro
     g = frame.astype(np.uint8)
     return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
 
@@ -85,7 +83,6 @@ def save_fits(frame: np.ndarray, path: str):
 
     data = frame
     if data.ndim == 3:
-        # para FITS normalmente guardas mono; tomamos canal 0
         data = data[:, :, 0]
 
     hdu = fits.PrimaryHDU(data.astype(np.uint16) if data.dtype != np.uint16 else data)
@@ -98,15 +95,15 @@ def save_fits(frame: np.ndarray, path: str):
 # ─────────────────────────────────────────────
 @dataclass
 class SequenceConfig:
-    cap_type: str            # "AVI" | "FITS" | "SER"(TODO)
-    exposure_s: float        # exposición por frame (ms en cámara)
+    cap_type: str
+    exposure_s: float
     gain: int
-    n_caps: int              # nº capturas (n videos o n fotos)
-    duration_s: Optional[float]  # solo para AVI/SER
-    roi: Optional[tuple[int, int, int, int]]  # (x,y,w,h) o None
+    n_caps: int
+    duration_s: Optional[float]
+    roi: Optional[tuple[int, int, int, int]]
     out_dir: str
-    fps: float               # fps de grabación para AVI (estimación/objetivo)
-    base_name: str           # prefijo archivo
+    fps: float
+    base_name: str
 
 
 # ─────────────────────────────────────────────
@@ -114,7 +111,7 @@ class SequenceConfig:
 # ─────────────────────────────────────────────
 class SequenceWorker(QObject):
     progress = Signal(str)
-    finished = Signal(list)  # lista de rutas generadas
+    finished = Signal(list)  # rutas generadas
     error = Signal(str)
 
     def __init__(self, cam, cfg: SequenceConfig):
@@ -134,6 +131,7 @@ class SequenceWorker(QObject):
             self._apply_capture_state()
 
             outputs: List[str] = []
+
             for i in range(1, self.cfg.n_caps + 1):
                 if self._abort:
                     self.progress.emit("Secuencia detenida por el usuario.")
@@ -162,7 +160,6 @@ class SequenceWorker(QObject):
                 else:
                     raise RuntimeError(f"Tipo no soportado: {self.cfg.cap_type}")
 
-            # restaurar
             self.progress.emit("Restaurando cámara…")
             self._restore_camera_state()
 
@@ -175,34 +172,21 @@ class SequenceWorker(QObject):
                 pass
             self.error.emit(str(e))
 
-    # ───────────── camera state
     def _save_camera_state(self):
-        # OJO: aquí solo guardamos lo que controlamos desde SequencePage
         self._saved_state["exposure_ms"] = None
         self._saved_state["gain"] = None
         self._saved_state["roi"] = None
 
-        # si tu cam_manager expone getters, aquí podrías leerlos
-        # si no, lo dejamos a None y restauramos a “valores UI” al final desde SequencePage si quieres
-
     def _apply_capture_state(self):
-        # ROI
         if self.cfg.roi is not None:
             x, y, w, h = self.cfg.roi
             _safe_call(self.cam, "set_roi", int(x), int(y), int(w), int(h))
 
-        # ganancia
         _safe_call(self.cam, "set_gain", int(self.cfg.gain))
-
-        # exposición en ms (para cámara)
         _safe_call(self.cam, "set_exposure", float(self.cfg.exposure_s * 1000.0))
 
-        # aseguramos que la cámara produce frames:
-        # En modo A, NO está corriendo LiveViewService,
-        # pero la cámara puede necesitar "start_live" para que get_frame funcione.
         _safe_call(self.cam, "start_live")
 
-        # pequeño warm-up: tirar 2 frames para estabilizar buffers
         for _ in range(2):
             if self._abort:
                 return
@@ -210,18 +194,9 @@ class SequenceWorker(QObject):
             time.sleep(0.02)
 
     def _restore_camera_state(self):
-        # parar stream interno de captura
         _safe_call(self.cam, "stop_live")
-
-        # restaurar ROI “full frame”
         _safe_call(self.cam, "set_roi", 0, 0, 999999, 999999)
 
-        # exposición/ganancia: si guardaste valores reales, restáuralos aquí.
-        # Si no, el CameraPage al reanudar LiveView suele re-aplicar sus sliders.
-        # (si quieres, luego lo afinamos para restaurar exacto)
-        return
-
-    # ───────────── capture primitives
     def _get_frame_safe(self) -> np.ndarray:
         frame = _safe_call(self.cam, "get_frame")
         if frame is None:
@@ -231,14 +206,12 @@ class SequenceWorker(QObject):
         return frame
 
     def _capture_single_frame(self) -> np.ndarray:
-        # Si tu cámara expone capture(ms), úsalo
         if callable(getattr(self.cam, "capture", None)):
             frame = self.cam.capture(float(self.cfg.exposure_s * 1000.0))
             if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
                 raise RuntimeError("capture() devolvió frame inválido.")
             return frame
 
-        # fallback: esperar exposición y leer frame
         time.sleep(float(self.cfg.exposure_s))
         return self._get_frame_safe()
 
@@ -251,7 +224,6 @@ class SequenceWorker(QObject):
         t0 = time.time()
         t_next = t0
 
-        # capturamos hasta duration_s
         while not self._abort and (time.time() - t0) < duration_s:
             now = time.time()
             if now < t_next:
@@ -262,7 +234,6 @@ class SequenceWorker(QObject):
             frames.append(f.copy())
             t_next += dt
 
-        # fps real aproximado
         elapsed = max(1e-6, time.time() - t0)
         fps_real = len(frames) / elapsed if frames else target_fps
 
@@ -281,11 +252,9 @@ class SequencePage(QWidget):
 
         self.cam = cam_manager
         self.live = live_service
-        self.live_panel = LiveViewPanel()
-        self.output_dir: Optional[str] = None
 
-        # si quieres capturar con ROI igual que camera_page:
-        self.roi: Optional[tuple[int, int, int, int]] = None  # o rellénalo desde fuera
+        self.output_dir: Optional[str] = None
+        self.roi: Optional[tuple[int, int, int, int]] = None
 
         self._thread: Optional[QThread] = None
         self._worker: Optional[SequenceWorker] = None
@@ -294,10 +263,11 @@ class SequencePage(QWidget):
         self._wire_live()
         self._wire_ui()
 
+        # defaults preview
+        self.live_panel.live_view.set_zoom("MAX")
         self.live_panel.live_view.set_color(True)
         self.live_panel.live_view.set_bayer_pattern("BGGR")
 
-    # ───────── UI
     def _build_ui(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -318,7 +288,6 @@ class SequencePage(QWidget):
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
 
-        # Left panel
         self.left = self._card()
         self.left.setFixedWidth(340)
         l = QVBoxLayout(self.left)
@@ -326,14 +295,39 @@ class SequencePage(QWidget):
         l.setSpacing(12)
 
         gb = QGroupBox("Secuencia")
+        gb.setStyleSheet("""
+            QGroupBox {
+                font-weight: 700;
+                border: 1px solid white;
+                border-radius: 8px;
+                margin-top: 12px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 6px;
+                color: #cfd6dd;
+            }
+        """)
         gl = QGridLayout(gb)
+
+
+        gl.setColumnMinimumWidth(0, 140)   # columna de labels
+        gl.setColumnStretch(0, 0)
+        gl.setColumnStretch(1, 1)          # columna de controles
+        gl.setHorizontalSpacing(12)
+        gl.setVerticalSpacing(8)
 
         gl.addWidget(QLabel("Tipo"), 0, 0)
         self.cb_type = QComboBox()
         self.cb_type.addItems(["AVI", "FITS", "SER"])
         gl.addWidget(self.cb_type, 0, 1)
 
-        gl.addWidget(QLabel("Exposición (s)"), 1, 0)
+        lbl = QLabel("Exposición (s)")
+        lbl.setMinimumWidth(130)
+        lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        gl.addWidget(lbl, 1, 0)
+
         self.sp_exp = QDoubleSpinBox()
         self.sp_exp.setRange(0.001, 3600.0)
         self.sp_exp.setDecimals(3)
@@ -368,9 +362,73 @@ class SequencePage(QWidget):
 
         l.addWidget(gb)
 
+        # ───── White Balance (preview)
+        gb_wb = QGroupBox("Balance Blancos (preview)")
+        gb_wb.setStyleSheet("""
+            QGroupBox {
+                font-weight: 700;
+                border: 1px solid white;
+                border-radius: 8px;
+                margin-top: 12px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 6px;
+                color: #cfd6dd;
+            }
+        """)
+        gw = QGridLayout(gb_wb)
+
+        gw.setColumnMinimumWidth(0, 22)
+        gw.setColumnStretch(1, 1)
+        gw.setHorizontalSpacing(10)
+        gw.setVerticalSpacing(6)
+
+        self.sl_wb_r = QSlider(Qt.Horizontal)
+        self.sl_wb_r.setRange(50, 250)
+        self.sl_wb_r.setValue(100)
+
+        self.sl_wb_g = QSlider(Qt.Horizontal)
+        self.sl_wb_g.setRange(50, 250)
+        self.sl_wb_g.setValue(100)
+
+        self.sl_wb_b = QSlider(Qt.Horizontal)
+        self.sl_wb_b.setRange(50, 250)
+        self.sl_wb_b.setValue(100)
+
+        for sl in (self.sl_wb_r, self.sl_wb_g, self.sl_wb_b):
+            sl.setMinimumHeight(18)
+            from PySide6.QtWidgets import QSizePolicy
+            sl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        gw.addWidget(QLabel("R"), 0, 0); gw.addWidget(self.sl_wb_r, 0, 1)
+        gw.addWidget(QLabel("G"), 1, 0); gw.addWidget(self.sl_wb_g, 1, 1)
+        gw.addWidget(QLabel("B"), 2, 0); gw.addWidget(self.sl_wb_b, 2, 1)
+
+        l.addWidget(gb_wb)
+
         # Destino
         gb_out = QGroupBox("Destino")
+        gb_out.setStyleSheet("""
+            QGroupBox {
+                font-weight: 700;
+                border: 1px solid white;
+                border-radius: 8px;
+                margin-top: 12px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 6px;
+                color: #cfd6dd;
+            }
+        """)
         gl_out = QGridLayout(gb_out)
+
+        gl_out.setColumnStretch(0, 1)
+        gl_out.setHorizontalSpacing(8)
+        gl_out.setVerticalSpacing(6)
 
         self.lbl_out_dir = QLabel("No seleccionado")
         self.lbl_out_dir.setWordWrap(True)
@@ -391,17 +449,19 @@ class SequencePage(QWidget):
         l.addWidget(self.btn_stop)
         l.addStretch(1)
 
-        # Center: Live view panel (compartido)
+        # Center: Live view panel
         self.live_panel = LiveViewPanel()
+
         splitter.addWidget(self.left)
         splitter.addWidget(self.live_panel)
         splitter.setStretchFactor(1, 1)
-        self.live_panel.live_view.set_zoom("MAX")
 
         root.addWidget(splitter, 1)
 
-        # estado de tipo
         self._on_type_changed(self.cb_type.currentText())
+
+        for lbl in self.findChildren(QLabel):
+            lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
     def _card(self) -> QFrame:
         w = QFrame()
@@ -409,7 +469,7 @@ class SequencePage(QWidget):
         return w
 
     def _wire_live(self):
-        # Compartir Live View (solo preview) — OJO: en MODELO A lo paramos al capturar.
+        # Solo preview: frames → panel
         self.live.frame_ready.connect(self.live_panel.live_view.set_frame)
         self.live.frame_ready.connect(self.live_panel.histogram.set_frame)
 
@@ -420,14 +480,25 @@ class SequencePage(QWidget):
 
         self.cb_type.currentTextChanged.connect(self._on_type_changed)
 
+        # WB SOLO aquí (no en _wire_live)
+        self.sl_wb_r.valueChanged.connect(self._on_wb_changed)
+        self.sl_wb_g.valueChanged.connect(self._on_wb_changed)
+        self.sl_wb_b.valueChanged.connect(self._on_wb_changed)
+
     def _on_type_changed(self, text: str):
         is_video = text in ("AVI", "SER")
         self.sp_duration.setEnabled(is_video)
         self.sp_duration.setVisible(is_video)
+
         self.sp_fps.setEnabled(text == "AVI")
         self.sp_fps.setVisible(text == "AVI")
 
-    # ───────── actions
+    def _on_wb_changed(self):
+        r = self.sl_wb_r.value() / 100.0
+        g = self.sl_wb_g.value() / 100.0
+        b = self.sl_wb_b.value() / 100.0
+        self.live_panel.live_view.set_white_balance(r, g, b)
+
     def choose_output_dir(self):
         path = QFileDialog.getExistingDirectory(
             self, "Elegir carpeta de destino", self.output_dir or os.getcwd()
@@ -438,12 +509,6 @@ class SequencePage(QWidget):
         self.lbl_out_dir.setText(path)
 
     def start_sequence(self):
-        """
-        MODELO A (FireCapture real):
-          1) STOP LiveViewService
-          2) Worker captura (controla cámara) en QThread
-          3) Al terminar, restaurar LiveViewService
-        """
         if self._thread is not None:
             return
 
@@ -462,26 +527,22 @@ class SequencePage(QWidget):
             gain=int(self.sp_gain.value()),
             n_caps=int(self.sp_captures.value()),
             duration_s=float(self.sp_duration.value()) if cap_type in ("AVI", "SER") else None,
-            roi=self.roi,  # si quieres, pásalo desde camera_page (o déjalo None)
+            roi=self.roi,
             out_dir=self.output_dir,
             fps=float(self.sp_fps.value()),
             base_name="sequence",
         )
-
         _ensure_dir(cfg.out_dir)
 
-        # UI state
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.lbl_status.setText("Deteniendo Live View…")
 
-        # 1) STOP LiveViewService (esto evita pantalla blanca)
         try:
             self.live.stop()
         except Exception:
             pass
 
-        # 2) Worker/QThread
         self._thread = QThread(self)
         self._worker = SequenceWorker(self.cam, cfg)
         self._worker.moveToThread(self._thread)
@@ -499,7 +560,6 @@ class SequencePage(QWidget):
             self.lbl_status.setText("Deteniendo secuencia…")
         self.btn_stop.setEnabled(False)
 
-    # ───────── callbacks
     def _on_progress(self, msg: str):
         self.lbl_status.setText(msg)
 
@@ -511,7 +571,6 @@ class SequencePage(QWidget):
         self._worker = None
 
     def _restart_live(self):
-        # Reanudar Live View para volver a preview
         try:
             self.live.start(12)
         except Exception:

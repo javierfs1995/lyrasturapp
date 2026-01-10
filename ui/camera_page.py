@@ -84,6 +84,7 @@ class SimulatedCameraManager:
         self._roi = None
         self._w = 1280
         self._h = 720
+        
 
     def start_live(self): return True
     def stop_live(self): return True
@@ -650,12 +651,34 @@ class CameraPage(QWidget):
         self.btn_capture_dir = QPushButton("📁 Carpeta de capturas")
         self.btn_capture_dir.setToolTip("Seleccionar carpeta donde guardar los vídeos")
 
-
+               
         gl.addWidget(self.btn_start, 0, 0, 1, 2)
         gl.addWidget(self.btn_stop, 0, 2, 1, 1)
         gl.addWidget(self.btn_project, 1, 0, 1, 3)
         gl.addWidget(self.btn_capture_dedicated, 2, 0, 1, 3)
         gl.addWidget(self.btn_capture_dir, 3, 0, 1, 3)
+        l.addWidget(gb_live)
+
+        # ───── White Balance (preview)
+        gb_wb = QGroupBox("White Balance")
+        gw = QGridLayout(gb_wb)
+
+        self.sl_wb_r = QSlider(Qt.Horizontal)
+        self.sl_wb_r.setRange(50, 250)
+        self.sl_wb_r.setValue(100)
+
+        self.sl_wb_g = QSlider(Qt.Horizontal)
+        self.sl_wb_g.setRange(50, 250)
+        self.sl_wb_g.setValue(100)
+
+        self.sl_wb_b = QSlider(Qt.Horizontal)
+        self.sl_wb_b.setRange(50, 250)
+        self.sl_wb_b.setValue(100)
+
+        gw.addWidget(QLabel("R"), 0, 0); gw.addWidget(self.sl_wb_r, 0, 1)
+        gw.addWidget(QLabel("G"), 1, 0); gw.addWidget(self.sl_wb_g, 1, 1)
+        gw.addWidget(QLabel("B"), 2, 0); gw.addWidget(self.sl_wb_b, 2, 1)
+        gl.addWidget(gb_wb)
 
         l.addWidget(gb_live)
 

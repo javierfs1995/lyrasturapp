@@ -25,6 +25,11 @@ class LiveViewWidget(QWidget):
 
         self.setStyleSheet("background-color: black;")
 
+        # White balance (preview only)
+        self.wb_r = 1.0
+        self.wb_g = 1.0
+        self.wb_b = 1.0
+
     # ─────────────────────────────
     # API pública
     # ─────────────────────────────
@@ -120,6 +125,21 @@ class LiveViewWidget(QWidget):
         except Exception:
             # fallback seguro
             self.bayer_pattern = "BGGR"
+    
+    def set_white_balance(self, r: float, g: float, b: float):
+        self.wb_r = max(0.1, r)
+        self.wb_g = max(0.1, g)
+        self.wb_b = max(0.1, b)
+        self.update()
+
+
+    def _apply_white_balance(self, rgb: np.ndarray) -> np.ndarray:
+        wb = np.empty_like(rgb, dtype=np.float32)
+        wb[..., 0] = rgb[..., 0] * self.wb_r
+        wb[..., 1] = rgb[..., 1] * self.wb_g
+        wb[..., 2] = rgb[..., 2] * self.wb_b
+
+        return np.clip(wb, 0, 255).astype(np.uint8)
 
     # ─────────────────────────────
     # Render FireCapture-like
@@ -138,6 +158,7 @@ class LiveViewWidget(QWidget):
         if frame.ndim == 2:
             if self.show_color:
                 rgb = self._debayer(frame)
+                rgb = self._apply_white_balance(rgb)
             else:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
         else:
