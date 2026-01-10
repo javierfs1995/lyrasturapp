@@ -125,21 +125,75 @@ class LiveViewWidget(QWidget):
         except Exception:
             # fallback seguro
             self.bayer_pattern = "BGGR"
-    
+
+    def auto_white_balance_roi(self):
+        if self.frame is None or self.frame.ndim != 2:
+            return
+
+        h, w = self.frame.shape
+
+        # ROI central pequeño (clave)
+        cy, cx = h // 2, w // 2
+        ry, rx = h // 10, w // 10
+        roi = self.frame[cy - ry:cy + ry, cx - rx:cx + rx]
+
+        # Debayer a float
+        rgb = self._debayer(roi).astype(np.float32)
+
+        r = rgb[..., 0]
+        g = rgb[..., 1]
+        b = rgb[..., 2]
+
+        # 🔥 SOLO píxeles claros, NO saturados
+        mask = (g > 120) & (g < 230)
+
+        if np.count_nonzero(mask) < 200:
+            return
+
+        mr = np.median(r[mask])
+        mg = np.median(g[mask])
+        mb = np.median(b[mask])
+
+        if mr <= 1 or mg <= 1 or mb <= 1:
+            return
+
+        # 🔥 FireCapture-style smoothing
+        wr = (mg / mr) ** 0.6
+        wb = (mg / mb) ** 0.6
+
+        # 🔒 límites duros (MUY importantes)
+        self.wb_r = float(np.clip(wr, 0.85, 1.20))
+        self.wb_g = 1.0
+        self.wb_b = float(np.clip(wb, 0.85, 1.20))
+
+        self.update()
+
+    def _apply_soft_ir_cut(self, rgb: np.ndarray) -> np.ndarray:
+        # ⚠️ SIEMPRE trabajar en float
+        out = rgb.astype(np.float32)
+
+        out[..., 0] *= 0.85   # R
+        out[..., 1] *= 1.00   # G
+        out[..., 2] *= 1.05   # B
+
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+
     def set_white_balance(self, r: float, g: float, b: float):
-        self.wb_r = max(0.1, r)
-        self.wb_g = max(0.1, g)
-        self.wb_b = max(0.1, b)
+        self.wb_r = float(r)
+        self.wb_g = float(g)
+        self.wb_b = float(b)
         self.update()
 
 
     def _apply_white_balance(self, rgb: np.ndarray) -> np.ndarray:
-        wb = np.empty_like(rgb, dtype=np.float32)
-        wb[..., 0] = rgb[..., 0] * self.wb_r
-        wb[..., 1] = rgb[..., 1] * self.wb_g
-        wb[..., 2] = rgb[..., 2] * self.wb_b
+        out = rgb.astype(np.float32)
 
-        return np.clip(wb, 0, 255).astype(np.uint8)
+        out[..., 0] *= self.wb_r
+        out[..., 1] *= self.wb_g
+        out[..., 2] *= self.wb_b
+
+        return np.clip(out, 0, 255).astype(np.uint8)
 
     # ─────────────────────────────
     # Render FireCapture-like
@@ -155,12 +209,14 @@ class LiveViewWidget(QWidget):
         frame = self.frame
 
         # ── Color / mono
-        if frame.ndim == 2:
-            if self.show_color:
-                rgb = self._debayer(frame)
-                rgb = self._apply_white_balance(rgb)
-            else:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+        if frame.ndim == 2 and self.show_color:
+            rgb = self._debayer(frame)
+            rgb = self._apply_soft_ir_cut(rgb)
+            rgb = self._apply_white_balance(rgb)
+
+        elif frame.ndim == 2:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+
         else:
             rgb = frame
 

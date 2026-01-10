@@ -119,13 +119,17 @@ class SequenceWorker(QObject):
             if frame is None:
                 continue
 
+            if self.params.get("color", False):
+                frame = self._debayer(frame)
+                frame = self._apply_white_balance(frame)
+
             if writer is None:
                 h, w = frame.shape[:2]
                 writer = SERWriter(
                     path=path,
                     width=w,
                     height=h,
-                    color=False,
+                    color=True,
                     bit_depth=8,
                     fps=1.0 / self.params["exposure_s"],
                 )
@@ -161,7 +165,11 @@ class SequenceWorker(QObject):
                 fourcc = cv2.VideoWriter_fourcc(*"MJPG")
                 writer = cv2.VideoWriter(path, fourcc, 1.0 / self.params["exposure_s"], (w, h), True)
 
-            if frame.ndim == 2:
+            if self.params.get("color", False):
+                frame = self._debayer(frame)
+                frame = self._apply_white_balance(frame)
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            else:
                 frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
             writer.write(frame)
@@ -190,3 +198,32 @@ class SequenceWorker(QObject):
         hdu.header["EXPTIME"] = self.params["exposure_s"]
         hdu.header["GAIN"] = self.params["gain"]
         hdu.writeto(path, overwrite=True)
+
+    def _debayer(self, frame: np.ndarray) -> np.ndarray:
+        pattern = self.params.get("bayer", "BGGR")
+
+        bayer_map = {
+            "RGGB": cv2.COLOR_BayerRG2RGB,
+            "BGGR": cv2.COLOR_BayerBG2RGB,
+            "GRBG": cv2.COLOR_BayerGR2RGB,
+            "GBRG": cv2.COLOR_BayerGB2RGB,
+        }
+
+        code = bayer_map.get(pattern)
+        if code is None:
+            raise RuntimeError(f"Patrón Bayer no soportado: {pattern}")
+
+        return cv2.cvtColor(frame, code)
+
+
+    def _apply_white_balance(self, rgb: np.ndarray) -> np.ndarray:
+        r = self.params.get("wb_r", 1.0)
+        g = self.params.get("wb_g", 1.0)
+        b = self.params.get("wb_b", 1.0)
+
+        out = rgb.astype(np.float32)
+        out[:, :, 0] *= r
+        out[:, :, 1] *= g
+        out[:, :, 2] *= b
+
+        return np.clip(out, 0, 255).astype(np.uint8)

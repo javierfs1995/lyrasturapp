@@ -407,6 +407,10 @@ class SequencePage(QWidget):
         gw.addWidget(QLabel("B"), 2, 0); gw.addWidget(self.sl_wb_b, 2, 1)
 
         l.addWidget(gb_wb)
+        
+        self.btn_auto_wb = QPushButton("🎯 Auto WB (ROI)")
+        l.addWidget(self.btn_auto_wb)
+
 
         # Destino
         gb_out = QGroupBox("Destino")
@@ -484,6 +488,9 @@ class SequencePage(QWidget):
         self.sl_wb_r.valueChanged.connect(self._on_wb_changed)
         self.sl_wb_g.valueChanged.connect(self._on_wb_changed)
         self.sl_wb_b.valueChanged.connect(self._on_wb_changed)
+        self.btn_auto_wb.clicked.connect(
+            self.live_panel.live_view.auto_white_balance_roi
+        )
 
     def _on_type_changed(self, text: str):
         is_video = text in ("AVI", "SER")
